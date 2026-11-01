@@ -214,12 +214,16 @@ end
 
 local function preservingConstraintSolve(state, graph, targets, settingsForLink, dt, bendDt, contactPoints)
   local before = clonePoints(state.points)
-  constraints.solveLengths(state.points, graph, CONSTRAINT_PASSES, targets[1])
+  local lengthPasses = CONSTRAINT_PASSES
+  if type(contactPoints) == "table" and next(contactPoints) ~= nil then
+    lengthPasses = math.min(12, CONSTRAINT_PASSES * 2)
+  end
+  constraints.solveLengths(state.points, graph, lengthPasses, targets[1], contactPoints)
   constraints.solveBend(state.points, graph, settingsForLink, targets, bendDt or dt, contactPoints)
   -- Bend preservation changes child directions. Apply angle/hinge limits last
   -- so bend stiffness cannot push a segment back outside its configured joint.
-  -- A point in surface contact is exempt from pose-bend and angle constraints;
-  -- length constraints remain active so the chain can settle along the surface.
+  -- Contacts may skip bend smoothing, but they do not pin articulated points or
+  -- exempt lengths/joints; otherwise a root-adjacent contact stretches the bone.
   constraints.solveAngle(state.points, graph, settingsForLink, targets, dt, contactPoints)
   for index, point in ipairs(state.points) do
     local old = before[index]
@@ -231,8 +235,53 @@ local function preservingConstraintSolve(state, graph, targets, settingsForLink,
   end
 end
 
+local function emptyCollisionStats()
+  return { contacts = 0, worldQueries = 0, selfPairs = 0, selfBudgetExceeded = false,
+    budgetExceeded = false, worldUnavailable = false, contactPoints = {} }
+end
+
+local function mergeCollisionStats(target, source)
+  source = source or {}
+  target.contacts = target.contacts + (tonumber(source.contacts) or 0)
+  target.worldQueries = math.max(target.worldQueries, tonumber(source.worldQueries) or 0)
+  target.selfPairs = target.selfPairs + (tonumber(source.selfPairs) or 0)
+  target.selfBudgetExceeded = target.selfBudgetExceeded or source.selfBudgetExceeded == true
+  target.budgetExceeded = target.budgetExceeded or source.budgetExceeded == true
+  target.worldUnavailable = target.worldUnavailable or source.worldUnavailable == true
+  for pointIndex in pairs(source.contactPoints or {}) do target.contactPoints[pointIndex] = true end
+  return target
+end
+
+local function mergeContactPoints(target, source)
+  for pointIndex in pairs(source or {}) do target[pointIndex] = true end
+  return target
+end
+
+local function resolveLocalContacts(state, context, dt, extraContactPoints)
+  local stats = emptyCollisionStats()
+  mergeContactPoints(stats.contactPoints, extraContactPoints)
+  local collisionContext = context.collisionContext
+  if not collisionContext or not collisionContext.enabled then
+    state.collisionDiagnostics = stats
+    return stats
+  end
+  local rootCollision = context.effectiveSettings[1] and context.effectiveSettings[1].collision or {}
+  local iterations = math.max(1, math.min(4, math.floor(tonumber(rootCollision.iterations) or 2)))
+  local bendDt = dt / (iterations + 1)
+  for iteration = 1, iterations do
+    local pass = collisionSolver.resolveState(state, context.graph, collisionContext,
+      context.effectiveSettings, context.pointOwners, dt, iteration == 1)
+    mergeCollisionStats(stats, pass)
+    preservingConstraintSolve(state, context.graph, context.targets,
+      function(index) return context.constraintSettings[index] end, dt, bendDt, stats.contactPoints)
+  end
+  -- Keep length/angle constraints last so contact projection cannot stretch links.
+  state.collisionDiagnostics = stats
+  return stats
+end
+
 local function simulateStep(state, graph, targets, input, effectiveSettings, gravityByLink, pointOwners,
-    tipMassByLink, dt, collisionContext)
+    tipMassByLink, dt, collisionContext, deferContacts, stepContext)
   local rootTarget = targets[1] or v(0, 0, 0)
   local rootAcceleration = input and input.rootAcceleration or v(0, 0, 0)
   if not validVector(rootAcceleration) then rootAcceleration = v(0, 0, 0) end
@@ -258,7 +307,7 @@ local function simulateStep(state, graph, targets, input, effectiveSettings, gra
       local effectiveMass = mass * tipMass
       local pull = math.max(0, tonumber(setting.pull) or 0) / effectiveMass
       local spring = math.max(0, math.min(1, tonumber(setting.spring) or 0))
-      local damping = math.max(0, tonumber(setting.damping) or 0) / math.sqrt(effectiveMass) * (1 - spring * 0.55)
+      local damping = math.max(0, tonumber(setting.damping) or 0) / math.sqrt(effectiveMass)
       local offset = sub(current, target)
       local gravityScale = 1 - falloff * math.exp(-length(offset) * 2.0)
       local acceleration = add(mul(gravity, gravityScale), mul(sub(target, current), pull))
@@ -307,6 +356,22 @@ local function simulateStep(state, graph, targets, input, effectiveSettings, gra
           nextVelocity = add(nextVelocity, sub(dampedVelocity, airRelativeVelocity))
         end
       end
+      if spring > 0 then
+        -- `spring` is the velocity returned when a point crosses its current
+        -- animation target. Pull controls how strongly it returns; damping
+        -- controls how quickly existing velocity fades. These controls no
+        -- longer alter one another.
+        local nextPoint = add(current, mul(nextVelocity, dt))
+        local nextOffset = sub(nextPoint, target)
+        local offsetLength = length(offset)
+        if offsetLength > 0.000001 and dot(offset, nextOffset) < 0 then
+          local outward = mul(offset, 1 / offsetLength)
+          local inwardSpeed = dot(nextVelocity, outward)
+          if inwardSpeed < 0 then
+            nextVelocity = sub(nextVelocity, mul(outward, (1 + spring) * inwardSpeed))
+          end
+        end
+      end
       state.previousPoints[pointIndex] = clonePoint(current)
       state.points[pointIndex] = add(current, mul(nextVelocity, dt))
       if not validVector(state.points[pointIndex]) then
@@ -317,39 +382,14 @@ local function simulateStep(state, graph, targets, input, effectiveSettings, gra
   state.points[1], state.previousPoints[1] = clonePoint(rootTarget), clonePoint(rootTarget)
 
   local function effective(index) return effectiveSettings[index] end
-  local collisionIterations = 0
-  if collisionContext and collisionContext.enabled then
-    local collisionSettings = effectiveSettings[1] and effectiveSettings[1].collision or {}
-    collisionIterations = math.max(1, math.min(4, math.floor(tonumber(collisionSettings.iterations) or 2)))
-  end
-  local bendDt = dt / (collisionIterations + 1)
-  preservingConstraintSolve(state, graph, targets, effective, dt, bendDt)
-  if collisionContext and collisionContext.enabled then
-    local collisionStats = { contacts = 0, worldQueries = 0, selfPairs = 0, selfBudgetExceeded = false,
-      budgetExceeded = false, worldUnavailable = false, contactPoints = {} }
-    for iteration = 1, collisionIterations do
-      local stats = collisionSolver.resolveState(state, graph, collisionContext, effectiveSettings, pointOwners, dt, iteration == 1)
-      collisionStats.contacts = collisionStats.contacts + stats.contacts
-      for pointIndex in pairs(stats.contactPoints or {}) do collisionStats.contactPoints[pointIndex] = true end
-      collisionStats.worldQueries = math.max(collisionStats.worldQueries, stats.worldQueries)
-      collisionStats.selfPairs = collisionStats.selfPairs + (stats.selfPairs or 0)
-      collisionStats.selfBudgetExceeded = collisionStats.selfBudgetExceeded or stats.selfBudgetExceeded == true
-      collisionStats.budgetExceeded = collisionStats.budgetExceeded or stats.budgetExceeded
-      collisionStats.worldUnavailable = collisionStats.worldUnavailable or stats.worldUnavailable
-      preservingConstraintSolve(state, graph, targets, effective, dt, bendDt, collisionStats.contactPoints)
-    end
-    local finalStats = collisionSolver.resolveState(state, graph, collisionContext, effectiveSettings, pointOwners, dt, false)
-    collisionStats.contacts = collisionStats.contacts + finalStats.contacts
-    for pointIndex in pairs(finalStats.contactPoints or {}) do collisionStats.contactPoints[pointIndex] = true end
-    collisionStats.worldQueries = math.max(collisionStats.worldQueries, finalStats.worldQueries)
-    collisionStats.selfPairs = collisionStats.selfPairs + (finalStats.selfPairs or 0)
-    collisionStats.selfBudgetExceeded = collisionStats.selfBudgetExceeded or finalStats.selfBudgetExceeded == true
-    collisionStats.budgetExceeded = collisionStats.budgetExceeded or finalStats.budgetExceeded
-    collisionStats.worldUnavailable = collisionStats.worldUnavailable or finalStats.worldUnavailable
-    state.collisionDiagnostics = collisionStats
+  preservingConstraintSolve(state, graph, targets, effective, dt)
+  if deferContacts then
+    state.collisionDiagnostics = { contacts = 0, worldQueries = 0, selfPairs = 0,
+      selfBudgetExceeded = false, budgetExceeded = false, worldUnavailable = false, deferred = true }
+  elseif collisionContext and collisionContext.enabled then
+    if stepContext then resolveLocalContacts(state, stepContext, dt) end
   else
-    state.collisionDiagnostics = { contacts = 0, worldQueries = 0, selfPairs = 0, selfBudgetExceeded = false,
-      budgetExceeded = false, worldUnavailable = false }
+    state.collisionDiagnostics = emptyCollisionStats()
   end
   state.points[1], state.previousPoints[1] = clonePoint(rootTarget), clonePoint(rootTarget)
 end
@@ -425,15 +465,14 @@ local function computeOffsets(state, graph, targets, linkFrames, jointFrames, dt
   return offsets, diagnostics
 end
 
-function core.step(state, graph, animatedPoints, input, settings, dt, gravityFrame, linkFrames, linkOverrides, jointFrames, collisionContext)
+function core.prepareWorldStep(state, graph, animatedPoints, input, settings, dt, gravityFrame,
+    linkFrames, linkOverrides, jointFrames, collisionContext, restPose)
   settings = settings or {}
   local safeDt = tonumber(dt)
   if not finite(safeDt) or safeDt <= 0 then safeDt = 1 / 20 end
   safeDt = math.min(MAX_FRAME_DT, safeDt)
   if not stateMatches(state, graph, animatedPoints) then state = core.newComponentState(graph, animatedPoints) end
   state.renderPreviousOffsets = copyOffsetList(state.offsets)
-  state.accumulator = math.min((state.accumulator or 0) + safeDt, FIXED_STEP * MAX_SUBSTEPS)
-  local steps = 0
   local frame = gravityFrame or identity()
   local effectiveSettings, constraintSettings, gravityByLink, pointOwners, tipMassByLink = {}, {}, {}, {}, {}
   state.gravityReferenceByLink = state.gravityReferenceByLink or {}
@@ -484,9 +523,7 @@ function core.step(state, graph, animatedPoints, input, settings, dt, gravityFra
       if tiltResponse > 0 and reference.direction then
         -- Balance the constant force at the component's initial pose. Only a
         -- change in world gravity relative to that pose can then deflect the
-        -- chain, so raised ears stay upright until their parent tilts. Clamp
-        -- the differential force to one base gravity: full inversion must not
-        -- double the load and snap a short, light chain.
+        -- chain. Clamp the differential force to one base gravity.
         local referenceGravity = mul(reference.direction, length(gravity))
         local dynamicGravity = sub(gravity, referenceGravity)
         dynamicGravity = capMagnitude(dynamicGravity, length(gravity))
@@ -499,32 +536,136 @@ function core.step(state, graph, animatedPoints, input, settings, dt, gravityFra
   for _, edge in ipairs(graph.edges or {}) do
     if edge.terminal then pointOwners[edge.to] = edge.fromLink end
   end
+  restPose = type(restPose) == "table" and restPose or settings.restPose
+  local targets = clonePoints(animatedPoints)
+  local restPoseAvailable = type(restPose) == "table" and #restPose == #targets
+  for pointIndex = 2, #targets do
+    local owner = pointOwners[pointIndex] or pointIndex
+    local setting = effectiveSettings[owner] or effectiveSettings[1] or {}
+    local mode = setting.animationTargetMode
+    local rest = restPoseAvailable and restPose[pointIndex] or nil
+    if validVector(rest) then
+      if mode == "rest" then
+        targets[pointIndex] = clonePoint(rest)
+      elseif mode == "hybrid" then
+        local influence = math.max(0, math.min(1, tonumber(setting.animationInfluence) or 1))
+        targets[pointIndex] = add(rest, mul(sub(animatedPoints[pointIndex], rest), influence))
+      end
+    end
+  end
   if collisionContext then collisionContext.enabled = hasEnabledCollision and collisionContext.frameAvailable == true end
-  local frameCollisionDiagnostics = { contacts = 0, worldQueries = 0, selfPairs = 0,
-    selfBudgetExceeded = false, budgetExceeded = false, worldUnavailable = false }
+  local context = {
+    state = state, graph = graph, targets = targets, animatedTargets = animatedPoints,
+    restPose = restPose, restPoseAvailable = restPoseAvailable, input = input,
+    settings = settings, linkFrames = linkFrames, jointFrames = jointFrames,
+    collisionContext = collisionContext, effectiveSettings = effectiveSettings,
+    constraintSettings = constraintSettings, gravityByLink = gravityByLink,
+    pointOwners = pointOwners, tipMassByLink = tipMassByLink,
+    hasEnabledCollision = hasEnabledCollision, safeDt = safeDt,
+    frameCollisionDiagnostics = emptyCollisionStats(),
+  }
+  return state, context
+end
+
+function core.advanceWorldSubstep(context, dt)
+  if type(context) ~= "table" or type(context.state) ~= "table" then return nil end
+  dt = tonumber(dt)
+  if not finite(dt) or dt <= 0 then dt = FIXED_STEP end
+  simulateStep(context.state, context.graph, context.targets, context.input,
+    context.constraintSettings, context.gravityByLink, context.pointOwners,
+    context.tipMassByLink, dt, context.collisionContext, true, context)
+  context.substeps = (context.substeps or 0) + 1
+  return context.state
+end
+
+function core.resolveWorldContacts(context, dt, contactPoints)
+  if type(context) ~= "table" or type(context.state) ~= "table" then return emptyCollisionStats() end
+  dt = tonumber(dt)
+  if not finite(dt) or dt <= 0 then dt = FIXED_STEP end
+  local stats
+  if context.collisionContext and context.collisionContext.enabled then
+    stats = resolveLocalContacts(context.state, context, dt, contactPoints)
+  else
+    stats = emptyCollisionStats()
+    preservingConstraintSolve(context.state, context.graph, context.targets,
+      function(index) return context.constraintSettings[index] end, dt, dt, contactPoints)
+    context.state.collisionDiagnostics = stats
+  end
+  local frame = context.frameCollisionDiagnostics
+  frame.contacts = frame.contacts + stats.contacts
+  frame.worldQueries = frame.worldQueries + stats.worldQueries
+  frame.selfPairs = frame.selfPairs + stats.selfPairs
+  frame.selfBudgetExceeded = frame.selfBudgetExceeded or stats.selfBudgetExceeded
+  frame.budgetExceeded = frame.budgetExceeded or stats.budgetExceeded
+  frame.worldUnavailable = frame.worldUnavailable or stats.worldUnavailable
+  return stats
+end
+
+function core.finishWorldFrame(context, dt)
+  if type(context) ~= "table" or type(context.state) ~= "table" then return nil, {}, {} end
+  local safeDt = tonumber(dt) or context.safeDt or 1 / 20
+  local state = context.state
+  local offsets, diagnostics = computeOffsets(state, context.graph, context.targets,
+    context.linkFrames, context.jointFrames, safeDt, context.effectiveSettings)
+  for index, diagnostic in ipairs(diagnostics or {}) do
+    diagnostic.gravityInParent = clonePoint(context.gravityByLink[index] or v(0, -9.81, 0))
+  end
+  state.offsets, state.diagnostics = offsets, diagnostics
+  local frameStats = context.frameCollisionDiagnostics or emptyCollisionStats()
+  frameStats.frameUnavailable = context.hasEnabledCollision
+    and context.collisionContext ~= nil and context.collisionContext.frameAvailable ~= true or false
+  state.collisionDiagnostics = frameStats
+  return state, offsets, diagnostics
+end
+
+function core.worldPointInfo(context)
+  local result = {}
+  if type(context) ~= "table" or type(context.state) ~= "table" then return result end
+  for pointIndex = 1, #context.state.points do
+    local owner = context.pointOwners[pointIndex] or (pointIndex == 1 and 1 or nil)
+    local setting = owner and (context.effectiveSettings[owner] or context.effectiveSettings[1]) or nil
+    local collision = setting and setting.collision or {}
+    local mass = math.max(0.05, tonumber(setting and setting.mass) or 1)
+    local tipMass = math.max(1, tonumber(context.tipMassByLink[owner or 1]) or 1)
+    local enabled = collision.enabled == true and collision.dynamic ~= false
+    local radius = enabled and math.max(0, tonumber(collision.radius) or 0) or 0
+    result[pointIndex] = {
+      radius = radius,
+      inverseMass = pointIndex == 1 and 0 or 1 / (mass * tipMass),
+      group = collision.group or "custom",
+      mask = collision.mask,
+      friction = collision.friction,
+      restitution = collision.restitution,
+      dynamic = radius > 0,
+    }
+  end
+  return result
+end
+
+function core.step(state, graph, animatedPoints, input, settings, dt, gravityFrame, linkFrames, linkOverrides, jointFrames, collisionContext)
+  local safeDt = tonumber(dt)
+  if not finite(safeDt) or safeDt <= 0 then safeDt = 1 / 20 end
+  safeDt = math.min(MAX_FRAME_DT, safeDt)
+  local context
+  state, context = core.prepareWorldStep(state, graph, animatedPoints, input, settings, safeDt,
+    gravityFrame, linkFrames, linkOverrides, jointFrames, collisionContext)
+  state.accumulator = math.min((state.accumulator or 0) + safeDt, FIXED_STEP * MAX_SUBSTEPS)
+  local steps = 0
   while state.accumulator >= FIXED_STEP and steps < MAX_SUBSTEPS do
-    simulateStep(state, graph, animatedPoints, input, constraintSettings, gravityByLink, pointOwners,
-      tipMassByLink, FIXED_STEP, collisionContext)
-    local stepDiagnostics = state.collisionDiagnostics or {}
-    frameCollisionDiagnostics.contacts = frameCollisionDiagnostics.contacts + (tonumber(stepDiagnostics.contacts) or 0)
-    frameCollisionDiagnostics.worldQueries = frameCollisionDiagnostics.worldQueries + (tonumber(stepDiagnostics.worldQueries) or 0)
-    frameCollisionDiagnostics.selfPairs = frameCollisionDiagnostics.selfPairs + (tonumber(stepDiagnostics.selfPairs) or 0)
-    frameCollisionDiagnostics.selfBudgetExceeded = frameCollisionDiagnostics.selfBudgetExceeded or stepDiagnostics.selfBudgetExceeded == true
-    frameCollisionDiagnostics.budgetExceeded = frameCollisionDiagnostics.budgetExceeded or stepDiagnostics.budgetExceeded == true
-    frameCollisionDiagnostics.worldUnavailable = frameCollisionDiagnostics.worldUnavailable or stepDiagnostics.worldUnavailable == true
+    simulateStep(state, graph, animatedPoints, input, context.constraintSettings,
+      context.gravityByLink, context.pointOwners, context.tipMassByLink,
+      FIXED_STEP, context.collisionContext, false, context)
+    local stepStats = state.collisionDiagnostics or {}
+    context.frameCollisionDiagnostics.contacts = context.frameCollisionDiagnostics.contacts + (tonumber(stepStats.contacts) or 0)
+    context.frameCollisionDiagnostics.worldQueries = context.frameCollisionDiagnostics.worldQueries + (tonumber(stepStats.worldQueries) or 0)
+    context.frameCollisionDiagnostics.selfPairs = context.frameCollisionDiagnostics.selfPairs + (tonumber(stepStats.selfPairs) or 0)
+    context.frameCollisionDiagnostics.selfBudgetExceeded = context.frameCollisionDiagnostics.selfBudgetExceeded or stepStats.selfBudgetExceeded == true
+    context.frameCollisionDiagnostics.budgetExceeded = context.frameCollisionDiagnostics.budgetExceeded or stepStats.budgetExceeded == true
+    context.frameCollisionDiagnostics.worldUnavailable = context.frameCollisionDiagnostics.worldUnavailable or stepStats.worldUnavailable == true
     state.accumulator = state.accumulator - FIXED_STEP
     steps = steps + 1
   end
-  state.collisionDiagnostics = frameCollisionDiagnostics
-  state.collisionDiagnostics.frameUnavailable = hasEnabledCollision
-    and collisionContext ~= nil and collisionContext.frameAvailable ~= true or false
-  local offsets, diagnostics = computeOffsets(state, graph, animatedPoints, linkFrames, jointFrames,
-    safeDt, effectiveSettings)
-  for index, diagnostic in ipairs(diagnostics or {}) do
-    diagnostic.gravityInParent = clonePoint(gravityByLink[index] or v(0, -9.81, 0))
-  end
-  state.offsets, state.diagnostics = offsets, diagnostics
-  return state, offsets, diagnostics
+  return core.finishWorldFrame(context, safeDt)
 end
 
 function core.interpolate(state, alpha)

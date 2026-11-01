@@ -27,10 +27,16 @@ local function edgeLength(points, edge)
   return length(sub(points[edge.to], points[edge.from]))
 end
 
-function constraints.solveLengths(points, graph, passes, pinnedRoot)
+function constraints.solveLengths(points, graph, passes, pinnedRoot, contactPoints)
   if type(points) ~= "table" or type(graph) ~= "table" then return points end
   passes = math.max(1, math.min(12, math.floor(tonumber(passes) or 4)))
   pinnedRoot = pinnedRoot or points[1]
+  local hasContacts = type(contactPoints) == "table" and next(contactPoints) ~= nil
+  if hasContacts then passes = math.min(12, passes * 2) end
+  -- A collider contact is a constraint on a particle, not an infinite-mass pin.
+  -- Pinning a contacted child beside the anchored root makes its bone impossible
+  -- to restore and lets the segment stretch. Keep only the animated root fixed;
+  -- the caller alternates this projection with collision resolution.
   for _ = 1, passes do
     for _, edge in ipairs(graph.edges or {}) do
       local from, to = points[edge.from], points[edge.to]
@@ -114,8 +120,8 @@ function constraints.solveAngle(points, graph, settingsForLink, targetPoints, dt
     local settings = settingsForLink and settingsForLink(edge.fromLink) or nil
     local joint = settings and settings.joint or {}
     local kind = joint.type or "cone"
-    local touchingSurface = contactPoints and (contactPoints[edge.from] or contactPoints[edge.to])
-    if kind ~= "free" and not touchingSurface then
+    -- Contacts do not disable articulation limits: the joint still has to stay within its configured cone.
+    if kind ~= "free" then
       local from, to = points[edge.from], points[edge.to]
       local targetFrom, targetTo = targetPoints[edge.from], targetPoints[edge.to]
       if from and to and targetFrom and targetTo then

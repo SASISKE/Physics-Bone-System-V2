@@ -12,3 +12,10 @@
 Профиль хвоста использует те же 11 pivot-групп `tail.001`–`tail.011`, что и ручной тест PhysBone v2. Изменения модели и анимаций можно продолжать делать в Blockbench; интерфейс и физика находятся в Lua-файлах `physics_bone_*.lua`.
 
 Для включения старого Physics Studio используй исходную аватару `Animation_Physics_Studio_Test`. В этой V2-копии старый скрипт не запускается, чтобы оба редактора не перехватывали F8 одновременно.
+
+## Документы PhysBone V2
+
+
+## Документы PhysBone V2
+
+[Описание системы](docs/physbone-v2/README.md), [установка](docs/physbone-v2/INSTALLATION.md), [ограничения](docs/physbone-v2/KNOWN_LIMITS.md), [краткий старт](docs/physbone-v2/QUICK_START_RU.md).

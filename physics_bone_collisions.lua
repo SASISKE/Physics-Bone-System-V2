@@ -245,6 +245,42 @@ local function sweptBoundsMayTouchShape(startPoint, endPoint, radius, shape)
     and math.min(startPoint.z, endPoint.z) <= maxZ + expansion
 end
 
+local function graphNeighborsAtDepth(graph, pointCount, depth)
+  local cache = type(graph._physicsNeighborCache) == "table" and graph._physicsNeighborCache or nil
+  if not cache then
+    local adjacency = {}
+    for _, edge in ipairs(graph.edges or {}) do
+      adjacency[edge.from] = adjacency[edge.from] or {}
+      adjacency[edge.to] = adjacency[edge.to] or {}
+      adjacency[edge.from][edge.to], adjacency[edge.to][edge.from] = true, true
+    end
+    cache = { adjacency = adjacency, byDepth = {}, maxDepth = 0 }
+    graph._physicsNeighborCache = cache
+  end
+  if cache.byDepth[depth] then return cache.byDepth[depth] end
+  local excludedByPoint = {}
+  for source = 2, pointCount do
+    local visited, frontier, excluded = { [source] = true }, { source }, {}
+    for _ = 1, depth do
+      local nextFrontier = {}
+      for _, index in ipairs(frontier) do
+        for neighbor in pairs(cache.adjacency[index] or {}) do
+          if not visited[neighbor] then
+            visited[neighbor], excluded[neighbor] = true, true
+            nextFrontier[#nextFrontier + 1] = neighbor
+          end
+        end
+      end
+      frontier = nextFrontier
+      if #frontier == 0 then break end
+    end
+    excludedByPoint[source] = excluded
+  end
+  cache.byDepth[depth] = excludedByPoint
+  cache.maxDepth = math.max(cache.maxDepth or 0, depth)
+  return excludedByPoint
+end
+
 function collisions.resolvePoint(position, previous, radius, shapes, dt, friction, restitution, applyVelocity)
   if applyVelocity == nil then applyVelocity = true end
   if not validVector(position) or not validVector(previous) then return position, previous, 0, {} end
@@ -300,19 +336,18 @@ function collisions.resolvePoint(position, previous, radius, shapes, dt, frictio
   return current, prior, contacts, responded
 end
 
-function collisions.resolveSelf(points, previousPoints, graph, pointRadii, dt, pointSettings, maxPairs)
-  local contacts, pairsChecked, budgetExceeded = 0, 0, false
+function collisions.resolveSelf(points, previousPoints, graph, pointRadii, dt, pointSettings, maxPairs, neighborDepth)
+  local contacts, pairsChecked, budgetExceeded, contactPoints = 0, 0, false, {}
   maxPairs = math.max(0, math.floor(tonumber(maxPairs) or 2048))
-  if maxPairs == 0 then return contacts, pairsChecked, false end
-  local adjacency = {}
-  for _, edge in ipairs(graph.edges or {}) do
-    adjacency[edge.from] = adjacency[edge.from] or {}
-    adjacency[edge.to] = adjacency[edge.to] or {}
-    adjacency[edge.from][edge.to], adjacency[edge.to][edge.from] = true, true
-  end
+  if maxPairs == 0 then return contacts, pairsChecked, false, contactPoints end
   local maxRadius = 0
   for index = 2, #points do maxRadius = math.max(maxRadius, tonumber(pointRadii[index]) or 0) end
-  if maxRadius <= 0 then return contacts, pairsChecked, false end
+  if maxRadius <= 0 then return contacts, pairsChecked, false, contactPoints end
+  neighborDepth = tonumber(neighborDepth)
+  if not finite(neighborDepth) then neighborDepth = 1 end
+  neighborDepth = math.min(math.max(0, math.floor(neighborDepth)), math.max(0, #points - 1))
+  local graphNeighbors = neighborDepth > 0
+    and graphNeighborsAtDepth(graph, #points, neighborDepth) or nil
   local cellSize = math.max(0.05, maxRadius * 2)
   local function cellOf(point)
     return math.floor(point.x / cellSize), math.floor(point.y / cellSize), math.floor(point.z / cellSize)
@@ -331,7 +366,6 @@ function collisions.resolveSelf(points, previousPoints, graph, pointRadii, dt, p
 
   local safeDt = math.max(0.000001, tonumber(dt) or 1 / 60)
   local function resolvePair(first, second)
-    if adjacency[first] and adjacency[first][second] then return end
     local a, b = points[first], points[second]
     local delta = sub(a, b)
     local distance = length(delta)
@@ -360,6 +394,7 @@ function collisions.resolveSelf(points, previousPoints, graph, pointRadii, dt, p
     previousPoints[first] = sub(points[first], mul(va, safeDt))
     previousPoints[second] = sub(points[second], mul(vb, safeDt))
     contacts = contacts + 1
+    contactPoints[first], contactPoints[second] = true, true
   end
 
   for first = 2, #points - 1 do
@@ -370,8 +405,8 @@ function collisions.resolveSelf(points, previousPoints, graph, pointRadii, dt, p
           for dz = -1, 1 do
             local bucket = buckets[cellKey(x + dx, y + dy, z + dz)]
             for _, second in ipairs(bucket or {}) do
-              if second > first + 1 and not (adjacency[first] and adjacency[first][second]) then
-                if pairsChecked >= maxPairs then budgetExceeded = true; return contacts, pairsChecked, budgetExceeded end
+              if second > first and not (graphNeighbors and graphNeighbors[first] and graphNeighbors[first][second]) then
+                if pairsChecked >= maxPairs then budgetExceeded = true; return contacts, pairsChecked, budgetExceeded, contactPoints end
                 pairsChecked = pairsChecked + 1
                 resolvePair(first, second)
               end
@@ -381,7 +416,7 @@ function collisions.resolveSelf(points, previousPoints, graph, pointRadii, dt, p
       end
     end
   end
-  return contacts, pairsChecked, budgetExceeded
+  return contacts, pairsChecked, budgetExceeded, contactPoints
 end
 
 function collisions.resolveState(state, graph, context, effectiveSettings, pointOwners, dt, applyVelocity)
@@ -427,11 +462,13 @@ function collisions.resolveState(state, graph, context, effectiveSettings, point
   end
   if selfEnabled then
     local rootCollision = effectiveSettings[1] and effectiveSettings[1].collision or {}
-    local contacts, pairsChecked, pairBudgetExceeded = collisions.resolveSelf(state.points, state.previousPoints,
-      graph, selfRadii, dt, selfSettings, rootCollision.maxSelfPairs or context.maxSelfPairs)
+    local contacts, pairsChecked, pairBudgetExceeded, selfContactPoints = collisions.resolveSelf(state.points, state.previousPoints,
+      graph, selfRadii, dt, selfSettings, rootCollision.maxSelfPairs or context.maxSelfPairs,
+      rootCollision.selfNeighborDepth or context.selfNeighborDepth)
     stats.contacts = stats.contacts + contacts
     stats.selfPairs = stats.selfPairs + pairsChecked
     stats.selfBudgetExceeded = pairBudgetExceeded
+    for pointIndex in pairs(selfContactPoints or {}) do stats.contactPoints[pointIndex] = true end
   end
   return stats
 end

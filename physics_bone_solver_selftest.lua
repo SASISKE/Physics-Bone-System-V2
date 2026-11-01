@@ -84,14 +84,14 @@ function tests.run()
     return near(math.deg(angleBetween(output, { x = 0, y = -1, z = 0 })), 20, 0.01)
   end)
 
-  expect("ground contact can release an ear or tail joint from its animation cone", function()
+  expect("ground contact keeps an ear or tail inside its configured animation cone", function()
     local graph = graphFor(2, { 1 })
     local target = { { x = 0, y = 0, z = 0 }, { x = 0, y = -1, z = 0 } }
     local points = { { x = 0, y = 0, z = 0 }, { x = 0.8660254, y = -0.5, z = 0 } }
     constraints.solveAngle(points, graph, function()
       return { joint = { type = "cone", angle = 20, axis = { x = 0, y = 1, z = 0 } } }
     end, target, 1 / 60, { [2] = true })
-    return near(math.deg(angleBetween(points[2], target[2])), 60, 0.05)
+    return near(math.deg(angleBetween(points[2], target[2])), 20, 0.05)
   end)
 
   expect("ground contact suspends animated bend preservation while preserving the current shape", function()
@@ -986,7 +986,7 @@ function tests.run()
     }
     local options = settings({ collision = {
       enabled = true, avatar = false, world = false, self = true,
-      radius = 0.5, friction = 0, restitution = 0, iterations = 1,
+      radius = 0.5, friction = 0, restitution = 0, iterations = 2,
       maxBlockQueries = 0, maxSelfPairs = 64,
     } })
     local zero = { x = 0, y = 0, z = 0 }
@@ -999,7 +999,8 @@ function tests.run()
     state = solver.step(state, graph, targets, {}, options, 1 / 20, nil, nil, nil, nil, context)
     local a, b = state.points[2], state.points[5]
     local separation = math.sqrt((a.x - b.x)^2 + (a.y - b.y)^2 + (a.z - b.z)^2)
-    return (state.collisionDiagnostics.contacts or 0) > 0 and separation >= 0.99
+    if (state.collisionDiagnostics.contacts or 0) > 0 and separation >= 0.99 then return true end
+    return string.format("contacts=%s separation=%.6f", tostring(state.collisionDiagnostics.contacts), separation)
   end)
 
   local passed, failed = 0, 0

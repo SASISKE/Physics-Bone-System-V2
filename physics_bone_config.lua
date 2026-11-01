@@ -1,8 +1,34 @@
 local configApi = {}
+local presetsApi = require("physics_bone_presets")
 
 local CONFIG_KEY = "physics_bone_v2"
 local PRESET_MODULE = "physics_bone_preset"
 local PRESET_ROOT = "PhysicsBoneV2/Characters"
+local GROUPS = { "body", "hair", "ears", "tail", "clothing", "accessories", "custom" }
+
+local function defaultCollisionMatrix()
+  local matrix = {}
+  for _, first in ipairs(GROUPS) do
+    matrix[first] = {}
+    for _, second in ipairs(GROUPS) do matrix[first][second] = true end
+  end
+  return matrix
+end
+
+local DEFAULT_WORLD = {
+  performance = "balanced",
+  fixedStep = 1 / 60,
+  maxSubsteps = 3,
+  maxFrameDt = 0.10,
+  maxPoints = 80,
+  maxCandidatePairs = 512,
+  contactIterations = 2,
+  cellSize = 1,
+  maxCellsPerProxy = 256,
+  maxBlockQueries = 64,
+  segmentMode = "point_segment",
+  collisionMatrix = defaultCollisionMatrix(),
+}
 
 local DEFAULT_SETTINGS = {
   enabled = true,
@@ -10,6 +36,8 @@ local DEFAULT_SETTINGS = {
   gravity = { x = 0, y = -9.81, z = 0 },
   gravityTiltResponse = 0.0,
   gravityFalloff = 0.0,
+  animationTargetMode = "hybrid",
+  animationInfluence = 0.65,
   -- Balanced starter values: visible secondary motion without disabling pose follow.
   pull = 60.0,
   spring = 0.22,
@@ -32,6 +60,10 @@ local DEFAULT_SETTINGS = {
     avatar = true,
     world = false,
     self = false,
+    selfNeighborDepth = 1,
+    group = "custom",
+    mask = {},
+    dynamic = true,
     radius = 0.5,
     friction = 0.25,
     restitution = 0.0,
@@ -50,6 +82,7 @@ local RANGES = {
   maxLinearSpeed = { 0, 60 }, angle = { 0, 180 }, angularSpeed = { 0, 720 },
   collisionRadius = { 0.05, 16 }, collisionFriction = { 0, 1 }, collisionRestitution = { 0, 1 },
   collisionQueries = { 0, 256 }, collisionSelfPairs = { 0, 16384 }, collisionIterations = { 1, 4 },
+  animationInfluence = { 0, 1 }, collisionSelfNeighborDepth = { 0, 8 },
 }
 
 local function finite(value)
@@ -68,7 +101,7 @@ function configApi.clone(value, seen)
 end
 
 function configApi.defaults()
-  return { schema = 1, components = {}, diagnostics = false }
+  return { schema = 2, world = configApi.clone(DEFAULT_WORLD), components = {}, colliders = {}, diagnostics = false }
 end
 
 local function clamp(value, range, fallback, label, warnings)
@@ -93,16 +126,69 @@ local function cleanPath(path)
   return result
 end
 
+local function cleanColliders(rawList, warnings, label, limit)
+  local result, seen = {}, {}
+  for index, source in ipairs(type(rawList) == "table" and rawList or {}) do
+    if index > (limit or 128) then
+      warnings[#warnings + 1] = label .. ": превышен лимит коллайдеров"
+      break
+    end
+    if type(source) == "table" then
+      local path = cleanPath(source.path)
+      local id = type(source.id) == "string" and source.id:sub(1, 512)
+        or (path and require("physics_bone_registry").pathKey(path))
+      if path and id and not seen[id] then
+        seen[id] = true
+        local offsetSource = type(source.offset) == "table" and source.offset or {}
+        local axisSource = type(source.axis) == "table" and source.axis or {}
+        local axis = { x = tonumber(axisSource.x), y = tonumber(axisSource.y), z = tonumber(axisSource.z) }
+        local axisLength = math.sqrt((axis.x or 0)^2 + (axis.y or 0)^2 + (axis.z or 0)^2)
+        if not finite(axis.x) or not finite(axis.y) or not finite(axis.z) or not finite(axisLength) or axisLength < 0.001 then
+          axis = { x = 0, y = 1, z = 0 }
+        else
+          axis = { x = axis.x / axisLength, y = axis.y / axisLength, z = axis.z / axisLength }
+        end
+        local offset = {}
+        for _, coordinate in ipairs({ "x", "y", "z" }) do
+          offset[coordinate] = clamp(offsetSource[coordinate], { -64, 64 }, 0,
+            label .. " collider " .. id .. " offset." .. coordinate, warnings)
+        end
+        local mask = {}
+        for _, group in ipairs(GROUPS) do
+          if type(source.mask) == "table" and source.mask[group] ~= nil then mask[group] = source.mask[group] == true end
+        end
+        local validGroups = { body = true, hair = true, ears = true, tail = true, clothing = true, accessories = true, custom = true }
+        local group = type(source.group) == "string" and validGroups[source.group] and source.group or "body"
+        result[#result + 1] = {
+          id = id, path = path, enabled = source.enabled ~= false,
+          shape = source.shape == "capsule" and "capsule" or "sphere",
+          group = group, mask = mask, offset = offset, axis = axis,
+          radius = clamp(source.radius, RANGES.collisionRadius, DEFAULT_SETTINGS.collision.radius,
+            label .. " collider " .. id .. " radius", warnings),
+          height = clamp(source.height, { 0, 64 }, 4, label .. " collider " .. id .. " height", warnings),
+        }
+      elseif path then
+        warnings[#warnings + 1] = label .. ": повторяется коллайдер " .. id
+      else
+        warnings[#warnings + 1] = label .. ": коллайдер " .. index .. " пропущен — неверный путь"
+      end
+    end
+  end
+  return result
+end
+
 local function cleanSettings(raw, warnings, label)
   raw = type(raw) == "table" and raw or {}
   local result = configApi.clone(DEFAULT_SETTINGS)
   result.enabled = raw.enabled ~= false
   result.gravitySpace = raw.gravitySpace == "local" and "local" or "world"
+  result.animationTargetMode = (raw.animationTargetMode == "animation" or raw.animationTargetMode == "rest")
+    and raw.animationTargetMode or "hybrid"
   local sourceGravity = type(raw.gravity) == "table" and raw.gravity or {}
   for _, axis in ipairs({ "x", "y", "z" }) do
     result.gravity[axis] = clamp(sourceGravity[axis], RANGES.gravity, DEFAULT_SETTINGS.gravity[axis], label .. " gravity." .. axis, warnings)
   end
-  for _, field in ipairs({ "gravityTiltResponse", "gravityFalloff", "pull", "spring", "damping", "mass", "tipMass", "bendStiffness", "rootMotionResponse", "motionDrag", "avatarMotionResponse", "maxLinearSpeed" }) do
+  for _, field in ipairs({ "gravityTiltResponse", "gravityFalloff", "animationInfluence", "pull", "spring", "damping", "mass", "tipMass", "bendStiffness", "rootMotionResponse", "motionDrag", "avatarMotionResponse", "maxLinearSpeed" }) do
     result[field] = clamp(raw[field], RANGES[field], DEFAULT_SETTINGS[field], label .. " " .. field, warnings)
   end
   local joint = type(raw.joint) == "table" and raw.joint or {}
@@ -122,6 +208,15 @@ local function cleanSettings(raw, warnings, label)
   result.collision.avatar = collision.avatar ~= false
   result.collision.world = collision.world == true
   result.collision.self = collision.self == true
+  result.collision.dynamic = collision.dynamic ~= false
+  result.collision.group = type(collision.group) == "string" and ({ body = true, hair = true, ears = true,
+    tail = true, clothing = true, accessories = true, custom = true })[collision.group] and collision.group or "custom"
+  result.collision.mask = {}
+  for _, group in ipairs(GROUPS) do
+    if type(collision.mask) == "table" and collision.mask[group] ~= nil then
+      result.collision.mask[group] = collision.mask[group] == true
+    end
+  end
   result.collision.radius = clamp(collision.radius, RANGES.collisionRadius, DEFAULT_SETTINGS.collision.radius, label .. " collision.radius", warnings)
   result.collision.friction = clamp(collision.friction, RANGES.collisionFriction, DEFAULT_SETTINGS.collision.friction, label .. " collision.friction", warnings)
   result.collision.restitution = clamp(collision.restitution, RANGES.collisionRestitution, DEFAULT_SETTINGS.collision.restitution, label .. " collision.restitution", warnings)
@@ -129,6 +224,9 @@ local function cleanSettings(raw, warnings, label)
     DEFAULT_SETTINGS.collision.maxBlockQueries, label .. " collision.maxBlockQueries", warnings))
   result.collision.maxSelfPairs = math.floor(clamp(collision.maxSelfPairs, RANGES.collisionSelfPairs,
     DEFAULT_SETTINGS.collision.maxSelfPairs, label .. " collision.maxSelfPairs", warnings))
+  result.collision.selfNeighborDepth = math.floor(clamp(collision.selfNeighborDepth,
+    RANGES.collisionSelfNeighborDepth, DEFAULT_SETTINGS.collision.selfNeighborDepth,
+    label .. " collision.selfNeighborDepth", warnings))
   result.collision.iterations = math.floor(clamp(collision.iterations, RANGES.collisionIterations,
     DEFAULT_SETTINGS.collision.iterations, label .. " collision.iterations", warnings))
   return result
@@ -143,10 +241,14 @@ local function cleanOverride(raw, warnings, label)
       else result.gravitySpace = raw.gravitySpace == "local" and "local" or "world" end
     end
   end
-  for _, field in ipairs({ "gravityTiltResponse", "gravityFalloff", "pull", "spring", "damping", "mass", "tipMass", "bendStiffness", "rootMotionResponse", "motionDrag", "avatarMotionResponse", "maxLinearSpeed" }) do
+  for _, field in ipairs({ "gravityTiltResponse", "gravityFalloff", "animationInfluence", "pull", "spring", "damping", "mass", "tipMass", "bendStiffness", "rootMotionResponse", "motionDrag", "avatarMotionResponse", "maxLinearSpeed" }) do
     if raw[field] ~= nil then
       result[field] = clamp(raw[field], RANGES[field], DEFAULT_SETTINGS[field], label .. " " .. field, warnings)
     end
+  end
+  if raw.animationTargetMode ~= nil then
+    result.animationTargetMode = (raw.animationTargetMode == "animation" or raw.animationTargetMode == "rest")
+      and raw.animationTargetMode or "hybrid"
   end
   if type(raw.gravity) == "table" then
     result.gravity = {}
@@ -173,17 +275,29 @@ local function cleanOverride(raw, warnings, label)
   if type(raw.collision) == "table" then
     local collision = raw.collision
     result.collision = {}
-    for _, field in ipairs({ "enabled", "avatar", "world", "self" }) do
+    for _, field in ipairs({ "enabled", "avatar", "world", "self", "dynamic" }) do
       if collision[field] ~= nil then result.collision[field] = collision[field] == true end
     end
-    for _, field in ipairs({ "radius", "friction", "restitution", "maxBlockQueries", "maxSelfPairs", "iterations" }) do
+    if collision.group ~= nil then
+      result.collision.group = type(collision.group) == "string"
+        and ({ body = true, hair = true, ears = true, tail = true, clothing = true, accessories = true, custom = true })[collision.group]
+        and collision.group or "custom"
+    end
+    if type(collision.mask) == "table" then
+      result.collision.mask = {}
+      for _, group in ipairs(GROUPS) do
+        if collision.mask[group] ~= nil then result.collision.mask[group] = collision.mask[group] == true end
+      end
+    end
+    for _, field in ipairs({ "radius", "friction", "restitution", "maxBlockQueries", "maxSelfPairs", "selfNeighborDepth", "iterations" }) do
       if collision[field] ~= nil then
         local rangeKey = ({ radius = "collisionRadius", friction = "collisionFriction",
           restitution = "collisionRestitution", maxBlockQueries = "collisionQueries",
           maxSelfPairs = "collisionSelfPairs", iterations = "collisionIterations" })[field]
+        if field == "selfNeighborDepth" then rangeKey = "collisionSelfNeighborDepth" end
         result.collision[field] = clamp(collision[field], RANGES[rangeKey], DEFAULT_SETTINGS.collision[field],
           label .. " collision." .. field, warnings)
-        if field == "maxBlockQueries" or field == "maxSelfPairs" or field == "iterations" then
+        if field == "maxBlockQueries" or field == "maxSelfPairs" or field == "selfNeighborDepth" or field == "iterations" then
           result.collision[field] = math.floor(result.collision[field])
         end
       end
@@ -198,7 +312,31 @@ function configApi.validate(raw)
     warnings[#warnings + 1] = "настройки v2 повреждены; загружены значения по умолчанию"
     return clean, warnings
   end
-  if raw.schema ~= 1 then warnings[#warnings + 1] = "неизвестная версия схемы; используется схема 1" end
+  if raw.schema ~= 1 and raw.schema ~= 2 then warnings[#warnings + 1] = "неизвестная версия схемы; применены безопасные значения" end
+  local world = type(raw.world) == "table" and raw.world or {}
+  clean.world.performance = (world.performance == "performance" or world.performance == "quality")
+    and world.performance or "balanced"
+  clean.world.fixedStep = clamp(world.fixedStep, { 1 / 120, 1 / 20 }, DEFAULT_WORLD.fixedStep, "world.fixedStep", warnings)
+  clean.world.maxSubsteps = math.floor(clamp(world.maxSubsteps, { 1, 5 }, DEFAULT_WORLD.maxSubsteps, "world.maxSubsteps", warnings))
+  clean.world.maxFrameDt = clamp(world.maxFrameDt, { 1 / 60, 0.25 }, DEFAULT_WORLD.maxFrameDt, "world.maxFrameDt", warnings)
+  clean.world.maxPoints = math.floor(clamp(world.maxPoints, { 1, 512 }, DEFAULT_WORLD.maxPoints, "world.maxPoints", warnings))
+  clean.world.maxCandidatePairs = math.floor(clamp(world.maxCandidatePairs, { 0, 4096 }, DEFAULT_WORLD.maxCandidatePairs, "world.maxCandidatePairs", warnings))
+  clean.world.contactIterations = math.floor(clamp(world.contactIterations, { 1, 4 }, DEFAULT_WORLD.contactIterations, "world.contactIterations", warnings))
+  clean.world.cellSize = clamp(world.cellSize, { 0.25, 8 }, DEFAULT_WORLD.cellSize, "world.cellSize", warnings)
+  clean.world.maxCellsPerProxy = math.floor(clamp(world.maxCellsPerProxy, { 8, 1024 }, DEFAULT_WORLD.maxCellsPerProxy, "world.maxCellsPerProxy", warnings))
+  clean.world.maxBlockQueries = math.floor(clamp(world.maxBlockQueries, { 0, 256 }, DEFAULT_WORLD.maxBlockQueries, "world.maxBlockQueries", warnings))
+  clean.world.segmentMode = world.segmentMode == "segment_segment" and "segment_segment" or "point_segment"
+  clean.colliders = cleanColliders(raw.colliders, warnings, "общие коллайдеры аватара", 128)
+  if type(world.collisionMatrix) == "table" then
+    for _, first in ipairs(GROUPS) do
+      local sourceRow = world.collisionMatrix[first]
+      if type(sourceRow) == "table" then
+        for _, second in ipairs(GROUPS) do
+          if sourceRow[second] ~= nil then clean.world.collisionMatrix[first][second] = sourceRow[second] == true end
+        end
+      end
+    end
+  end
   clean.diagnostics = raw.diagnostics == true
   local roots = {}
   for index, source in ipairs(type(raw.components) == "table" and raw.components or {}) do
@@ -216,6 +354,8 @@ function configApi.validate(raw)
           id = type(source.id) == "string" and source.id:sub(1, 80) or ("component_" .. index),
           name = type(source.name) == "string" and source.name:sub(1, 80) or "PhysBone",
           enabled = source.enabled ~= false,
+          kind = ({ body = true, hair = true, ears = true, tail = true, clothing = true, accessories = true, custom = true })[source.kind]
+            and source.kind or "custom",
           rootPath = rootPath,
           branchMode = source.branchMode == "all" and "all" or "selected",
           branchChoices = {}, excludedPaths = {},
@@ -224,6 +364,21 @@ function configApi.validate(raw)
           settings = cleanSettings(source.settings, warnings, "компонент " .. index),
           linkOverrides = {},
         }
+        local preset = type(source.presetId) == "string" and presetsApi.get(source.presetId) or nil
+        if preset and preset.kind == component.kind then component.presetId = preset.id end
+        if type(source.restPose) == "table" then
+          component.restPose = {}
+          for pointIndex, point in ipairs(source.restPose) do
+            if pointIndex > 512 then warnings[#warnings + 1] = "компонент " .. index .. ": поза покоя ограничена 512 точками"; break end
+            if type(point) == "table" and finite(tonumber(point.x)) and finite(tonumber(point.y)) and finite(tonumber(point.z)) then
+              component.restPose[pointIndex] = { x = clamp(point.x, { -64, 64 }, 0, "restPose.x", warnings),
+                y = clamp(point.y, { -64, 64 }, 0, "restPose.y", warnings),
+                z = clamp(point.z, { -64, 64 }, 0, "restPose.z", warnings) }
+            else
+              warnings[#warnings + 1] = "компонент " .. index .. ": неверная точка позы покоя пропущена"
+            end
+          end
+        end
         for parentKey, childKey in pairs(type(source.branchChoices) == "table" and source.branchChoices or {}) do
           if type(parentKey) == "string" and type(childKey) == "string" then component.branchChoices[parentKey:sub(1, 512)] = childKey:sub(1, 512) end
         end
@@ -248,46 +403,7 @@ function configApi.validate(raw)
             component.linkOverrides[key:sub(1, 512)] = cleanOverride(override, warnings, "звено " .. key)
           end
         end
-        local colliderIds = {}
-        for colliderIndex, sourceCollider in ipairs(type(source.colliders) == "table" and source.colliders or {}) do
-          if colliderIndex > 128 then warnings[#warnings + 1] = "компонент " .. index .. ": превышен лимит 128 коллайдеров"; break end
-          if type(sourceCollider) == "table" then
-            local path = cleanPath(sourceCollider.path)
-            local id = type(sourceCollider.id) == "string" and sourceCollider.id:sub(1, 512)
-              or (path and require("physics_bone_registry").pathKey(path))
-            if path and id and not colliderIds[id] then
-              colliderIds[id] = true
-              local offsetSource = type(sourceCollider.offset) == "table" and sourceCollider.offset or {}
-              local axisSource = type(sourceCollider.axis) == "table" and sourceCollider.axis or {}
-              local axis = { x = tonumber(axisSource.x), y = tonumber(axisSource.y), z = tonumber(axisSource.z) }
-              local axisLength = math.sqrt((axis.x or 0)^2 + (axis.y or 0)^2 + (axis.z or 0)^2)
-              if not finite(axis.x) or not finite(axis.y) or not finite(axis.z) or not finite(axisLength) or axisLength < 0.001 then
-                axis = { x = 0, y = 1, z = 0 }
-              else
-                axis = { x = axis.x / axisLength, y = axis.y / axisLength, z = axis.z / axisLength }
-              end
-              local offset = {}
-              for _, coordinate in ipairs({ "x", "y", "z" }) do
-                offset[coordinate] = clamp(offsetSource[coordinate], { -64, 64 }, 0,
-                  "коллайдер " .. id .. " offset." .. coordinate, warnings)
-              end
-              component.colliders[#component.colliders + 1] = {
-                id = id, path = path,
-                enabled = sourceCollider.enabled ~= false,
-                shape = sourceCollider.shape == "capsule" and "capsule" or "sphere",
-                offset = offset, axis = axis,
-                radius = clamp(sourceCollider.radius, RANGES.collisionRadius, DEFAULT_SETTINGS.collision.radius,
-                  "коллайдер " .. id .. " radius", warnings),
-                height = clamp(sourceCollider.height, { 0, 64 }, 4,
-                  "коллайдер " .. id .. " height", warnings),
-              }
-            elseif path then
-              warnings[#warnings + 1] = "компонент " .. index .. ": повторяется коллайдер " .. id
-            else
-              warnings[#warnings + 1] = "компонент " .. index .. ": коллайдер " .. colliderIndex .. " пропущен — неверный путь"
-            end
-          end
-        end
+        component.colliders = cleanColliders(source.colliders, warnings, "компонент " .. index, 128)
         clean.components[#clean.components + 1] = component
       end
     end
@@ -389,6 +505,7 @@ function configApi.defaultsForComponent(rootPath, name)
   return {
     id = "physbone_" .. string.format("%08x", hash),
     name = name or "PhysBone",
+    kind = "custom",
     enabled = true,
     rootPath = configApi.clone(rootPath), branchMode = "selected",
     branchChoices = {}, excludedPaths = {},
@@ -396,6 +513,37 @@ function configApi.defaultsForComponent(rootPath, name)
     endpoint = { mode = "child" },
     settings = configApi.clone(DEFAULT_SETTINGS), linkOverrides = {},
   }
+end
+
+function configApi.componentKinds()
+  return presetsApi.componentKinds()
+end
+
+function configApi.componentKindLabel(kind)
+  return presetsApi.kindLabel(kind)
+end
+
+function configApi.presetsForKind(kind)
+  return presetsApi.presetsForKind(kind)
+end
+
+function configApi.applyPreset(component, presetId)
+  if type(component) ~= "table" then return false, "не выбран компонент" end
+  local preset = presetsApi.get(presetId)
+  if not preset then return false, "стартовый профиль не найден" end
+  local settings = configApi.clone(DEFAULT_SETTINGS)
+  local function merge(target, source)
+    for key, value in pairs(source or {}) do
+      if type(value) == "table" and type(target[key]) == "table" then merge(target[key], value)
+      else target[key] = configApi.clone(value) end
+    end
+  end
+  merge(settings, preset.settings)
+  settings.collision.group = preset.kind
+  component.kind = preset.kind
+  component.presetId = preset.id
+  component.settings = settings
+  return true, preset.label
 end
 
 return configApi

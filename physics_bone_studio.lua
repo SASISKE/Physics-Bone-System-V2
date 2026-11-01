@@ -5,11 +5,13 @@ local inputApi = require("physics_bone_input")
 local core = require("physics_bone_core")
 local gizmosApi = require("physics_bone_gizmos")
 local uiApi = require("physics_bone_ui")
+local worldApi = require("physics_bone_world")
 
 local studio = {
   initialized = false, rootPart = nil, registry = nil,
   savedConfig = nil, draftConfig = nil, runtimes = {}, graphs = {},
   input = inputApi.new(), ui = nil, gizmos = gizmosApi.new(),
+  physicsWorld = worldApi.new(), worldDiagnostics = {}, worldQueryBudget = { cache = {} },
   lastInput = nil, alive = true, playerWasLoaded = nil, lastError = nil,
 }
 
@@ -151,7 +153,20 @@ local function capVector(value, maximum)
   return scale(value, maximum / magnitude)
 end
 
+local function validMatrix(matrix)
+  if type(matrix) ~= "table" then return false end
+  for row = 1, 3 do
+    if type(matrix[row]) ~= "table" then return false end
+    for column = 1, 3 do
+      local entry = matrix[row][column]
+      if type(entry) ~= "number" or entry ~= entry or entry == math.huge or entry == -math.huge then return false end
+    end
+  end
+  return true
+end
+
 local function transform(matrix, value)
+  if not validMatrix(matrix) then return vec3(value.x, value.y, value.z) end
   return vec3(
     matrix[1][1] * value.x + matrix[1][2] * value.y + matrix[1][3] * value.z,
     matrix[2][1] * value.x + matrix[2][2] * value.y + matrix[2][3] * value.z,
@@ -212,12 +227,15 @@ local function newCollisionContext(runtime)
   local context = {
     enabled = false, avatarShapes = {}, rootOriginWorld = vec3(0, 0, 0),
     worldScale = 1, frameAvailable = false, worldQueries = 0, budgetExceeded = false, worldUnavailable = false,
+    sharedQueryBudget = nil,
   }
   context.toWorldPoint = function(point)
+    if context.frameAvailable ~= true or not validMatrix(context.parentToWorld) then return nil end
     local offset = transform(context.parentToWorld, point)
     return vec3(context.rootOriginWorld.x + offset.x, context.rootOriginWorld.y + offset.y, context.rootOriginWorld.z + offset.z)
   end
   context.toParentVector = function(direction)
+    if context.frameAvailable ~= true or not validMatrix(context.worldToParent) then return nil end
     return transform(context.worldToParent, direction)
   end
   context.queryWorld = function(position, radius)
@@ -232,13 +250,20 @@ local function newCollisionContext(runtime)
           local key = blockX .. ":" .. blockY .. ":" .. blockZ
           local cached = context.blockCache[key]
           if cached == nil then
-            if context.worldQueries >= context.maxBlockQueries then
+            local sharedBudget = context.sharedQueryBudget
+            if context.worldQueries >= context.maxBlockQueries
+              or (sharedBudget and (tonumber(sharedBudget.remaining) or 0) <= 0) then
               exhausted = true
               context.budgetExceeded = true
+              if sharedBudget then sharedBudget.exhausted = true end
               break
             end
             local shapes, available = blockAabbsAt(blockX, blockY, blockZ, context.getBlockState)
             context.worldQueries = context.worldQueries + 1
+            if sharedBudget then
+              sharedBudget.remaining = math.max(0, (tonumber(sharedBudget.remaining) or 0) - 1)
+              sharedBudget.total = (tonumber(sharedBudget.total) or 0) + 1
+            end
             context.worldAvailable = context.worldAvailable and available == true
             cached = shapes or {}
             context.blockCache[key] = cached
@@ -251,9 +276,10 @@ local function newCollisionContext(runtime)
     end
     return result, context.worldQueries - before, exhausted, context.worldAvailable
   end
-  context.beginTick = function(settings)
+  context.beginTick = function(settings, sharedQueryBudget)
     local collision = settings or {}
-    context.blockCache = {}
+    context.sharedQueryBudget = sharedQueryBudget
+    context.blockCache = sharedQueryBudget and sharedQueryBudget.cache or {}
     context.worldQueries = 0
     context.budgetExceeded = false
     context.worldUnavailable = false
@@ -294,7 +320,9 @@ local function updateCollisionFrame(runtime)
   context.rootOriginWorld = vectorFrom(rootOrigin)
   context.worldScale = math.max(vectorLength(worldAxes[1]), vectorLength(worldAxes[2]), vectorLength(worldAxes[3]), 0.000001)
   context.avatarShapes = {}
-  for _, collider in ipairs(runtime.config.colliders or {}) do
+  context.collisionMatrix = studio.draftConfig and studio.draftConfig.world
+    and studio.draftConfig.world.collisionMatrix or nil
+  local function appendCollider(collider)
     if collider.enabled ~= false then
       local key = registryApi.pathKey(collider.path)
       local node = studio.registry and studio.registry.byKey[key]
@@ -319,18 +347,22 @@ local function updateCollisionFrame(runtime)
               (offset.z or 0) + (axis.z or 0) * halfHeight))
             if first and second then
               context.avatarShapes[#context.avatarShapes + 1] = {
-                id = collider.id, kind = "capsule", a = vectorFrom(first), b = vectorFrom(second), radius = radius,
+                id = collider.id, kind = "capsule", group = collider.group or "body", mask = collider.mask,
+                a = vectorFrom(first), b = vectorFrom(second), radius = radius,
               }
             end
           else
             context.avatarShapes[#context.avatarShapes + 1] = {
-              id = collider.id, kind = "sphere", center = vectorFrom(center), radius = radius,
+              id = collider.id, kind = "sphere", group = collider.group or "body", mask = collider.mask,
+              center = vectorFrom(center), radius = radius,
             }
           end
         end
       end
     end
   end
+  for _, collider in ipairs(studio.draftConfig and studio.draftConfig.colliders or {}) do appendCollider(collider) end
+  for _, collider in ipairs(runtime.config.colliders or {}) do appendCollider(collider) end
 end
 
 local function sampleFrameMotion(runtime, currentFrame, dt, tick)
@@ -653,7 +685,8 @@ local function rebuildRuntime()
   if studio.gizmos.visible and studio.ui then
     local component = studio.ui:selection()
     local selectedKey = component and registryApi.pathKey(component.rootPath) or nil
-    gizmosApi.setVisible(studio.gizmos, studio.runtimes, true, selectedKey)
+    gizmosApi.setVisible(studio.gizmos, studio.runtimes, true, selectedKey, studio.registry,
+      studio.draftConfig and studio.draftConfig.colliders, studio.draftConfig)
   end
 end
 
@@ -699,6 +732,9 @@ local function applyDraft(raw, resetComponentId)
   local clean, warnings = configApi.validate(raw)
   local topologyChanged = not sameTopology(studio.draftConfig, clean)
   studio.draftConfig = clean
+  if studio.physicsWorld and type(studio.physicsWorld.configure) == "function" then
+    studio.physicsWorld:configure(clean.world)
+  end
   if topologyChanged then rebuildRuntime() else updateRuntimeConfig(clean, resetComponentId) end
   if studio.ui then studio.ui:setDraft(clean, studio.graphs) end
   if #warnings > 0 and studio.ui then studio.ui.status = warnings[1]; studio.ui:refresh() end
@@ -716,6 +752,25 @@ local function saveDraft()
   if #((warnings) or {}) > 0 and studio.ui then studio.ui.status = warnings[1]; studio.ui:refresh() end
 end
 
+local function captureRestPose(componentId)
+  local runtime
+  for _, candidate in ipairs(studio.runtimes or {}) do
+    if candidate.componentId == componentId then runtime = candidate; break end
+  end
+  if not runtime or not runtime.enabled or studio.alive == false or studio.playerWasLoaded == false then
+    return false, "Нельзя сохранить позу: компонент или игрок сейчас не готовы."
+  end
+  local targets = buildAnimatedTargets(runtime)
+  for _, component in ipairs(studio.draftConfig.components or {}) do
+    if component.id == componentId then
+      component.restPose = configApi.clone(targets)
+      applyDraft(studio.draftConfig, componentId)
+      return true, "Поза покоя захвачена. Поставь персонажа в нейтральную позу и нажми «Сохранить» для постоянного применения."
+    end
+  end
+  return false, "Компонент для калибровки не найден."
+end
+
 local function initialize()
   studio.rootPart = modelRoot()
   if not studio.rootPart then return false end
@@ -728,6 +783,9 @@ local function initialize()
   local loaded, warnings = configApi.load()
   studio.savedConfig = configApi.clone(loaded)
   studio.draftConfig = configApi.clone(loaded)
+  if studio.physicsWorld and type(studio.physicsWorld.configure) == "function" then
+    studio.physicsWorld:configure(loaded.world)
+  end
   studio.initialized = true
   studio.ui = uiApi.new(registry, studio.draftConfig, {
     changed = function(raw, resetComponentId) applyDraft(raw, resetComponentId) end,
@@ -743,6 +801,11 @@ local function initialize()
         applyDraft(imported)
         if studio.ui then studio.ui.status = "Загружен профиль из physics_bone_preset.lua; сохрани, чтобы применить локально."; studio.ui:refresh() end
       elseif studio.ui then studio.ui.status = importWarnings; studio.ui:refresh() end
+    end,
+    captureRestPose = function(componentId)
+      local ok, message = captureRestPose(componentId)
+      if studio.ui then studio.ui.status = message; studio.ui:refresh() end
+      return ok
     end,
   })
   rebuildRuntime()
@@ -837,6 +900,13 @@ function studio.tick()
       resetFrameMotion(runtime)
     end
   end
+  local queryBudget = studio.worldQueryBudget
+  queryBudget.cache = queryBudget.cache or {}
+  for key in pairs(queryBudget.cache) do queryBudget.cache[key] = nil end
+  queryBudget.remaining = math.max(0, math.floor(tonumber(studio.draftConfig
+    and studio.draftConfig.world and studio.draftConfig.world.maxBlockQueries) or studio.physicsWorld.maxBlockQueries or 64))
+  queryBudget.total = 0
+  queryBudget.exhausted = false
   local bodyYaw = safeCall(player, "getBodyYaw")
   local motion = studio.input:sample(player, bodyYaw, TICK_DT)
   if studio.testCapture and type(studio.testInputProvider) == "function" then
@@ -904,7 +974,7 @@ function studio.tick()
           and not (studio.testCapture and runtime.testCollisionSettings) then
           for key, value in pairs(rootOverride.collision) do tickCollision[key] = value end
         end
-        runtime.collisionContext.beginTick(tickCollision)
+        runtime.collisionContext.beginTick(tickCollision, queryBudget)
       else
         runtime.collisionContext.enabled = false
       end
@@ -941,16 +1011,14 @@ function studio.tick()
         runtime.testWorldSeedApplied = true
       end
       if studio.testCapture then runtime.testTargets = targets end
-      local solverStarted = studio.testCapture and solverClockMs() or nil
-      runtime.state, runtime.offsets, runtime.diagnostics = core.step(
+      runtime.state, runtime.worldStepContext = core.prepareWorldStep(
         runtime.state, runtime.graph, targets, localMotion, settingsForStep, TICK_DT,
-        runtime.gravityFrame, frames, runtime.linkOverrides, jointFrames, runtime.collisionContext)
-      if studio.testCapture then
-        local solverFinished = solverClockMs()
-        runtime.testSolverTimeMs = solverStarted and solverFinished and math.max(0, solverFinished - solverStarted) or nil
-      end
-      runtime.collisionDiagnostics = runtime.state.collisionDiagnostics or {}
+        runtime.gravityFrame, frames, runtime.linkOverrides, jointFrames, runtime.collisionContext,
+        runtime.config and runtime.config.restPose)
+      runtime.worldPointInfo = core.worldPointInfo(runtime.worldStepContext)
     else
+      runtime.worldStepContext = nil
+      runtime.worldPointInfo = nil
       resetFrameMotion(runtime)
       runtime.localMotion = {
         rootVelocity = vec3(0, 0, 0),
@@ -960,11 +1028,61 @@ function studio.tick()
       }
     end
   end
-  if studio.ui and studio.ui.open and studio.draftConfig.diagnostics and studio.tickCount % 5 == 0 then
+  local worldComponents = {}
+  for _, runtime in ipairs(studio.runtimes) do
+    if runtime.enabled and runtime.worldStepContext then
+      worldComponents[#worldComponents + 1] = {
+        id = runtime.componentId, enabled = true, runtime = runtime,
+        state = runtime.state, graph = runtime.graph, pointInfo = runtime.worldPointInfo,
+        frame = runtime.collisionContext,
+        group = runtime.settings and runtime.settings.collision and runtime.settings.collision.group or "custom",
+        mask = runtime.settings and runtime.settings.collision and runtime.settings.collision.mask,
+      }
+    end
+  end
+  local diagnosticsVisible = studio.ui and studio.ui.open and studio.draftConfig
+    and studio.draftConfig.diagnostics == true
+  local measureWorld = studio.testCapture == true or diagnosticsVisible == true
+  local worldSolverStarted = measureWorld and solverClockMs() or nil
+  local worldStats = studio.physicsWorld:step(TICK_DT, worldComponents, {
+    integrate = function(component, dt)
+      local runtime = component.runtime
+      core.advanceWorldSubstep(runtime.worldStepContext, dt)
+      component.state = runtime.state
+    end,
+    resolveLocal = function(component, dt, contactPoints)
+      local runtime = component.runtime
+      core.resolveWorldContacts(runtime.worldStepContext, dt, contactPoints)
+    end,
+  })
+  local worldSolverFinished = measureWorld and solverClockMs() or nil
+  if worldSolverStarted and worldSolverFinished then
+    worldStats.frameTimeMs = math.max(0, worldSolverFinished - worldSolverStarted)
+  end
+  worldStats.worldQueries = math.max(worldStats.worldQueries or 0, queryBudget.total or 0)
+  worldStats.worldQueryBudget = queryBudget.remaining + (queryBudget.total or 0)
+  worldStats.blockBudgetExceeded = worldStats.blockBudgetExceeded or queryBudget.exhausted == true
+  studio.worldDiagnostics = worldStats
+  for _, component in ipairs(worldComponents) do
+    local runtime = component.runtime
+    runtime.state, runtime.offsets, runtime.diagnostics = core.finishWorldFrame(runtime.worldStepContext, TICK_DT)
+    runtime.renderOffsets = runtime.offsets
+    runtime.collisionDiagnostics = runtime.state.collisionDiagnostics or {}
+  end
+  if studio.testCapture then
+    local elapsed = worldSolverStarted and worldSolverFinished and math.max(0, worldSolverFinished - worldSolverStarted) or nil
+    local share = elapsed and tonumber(worldStats.activeComponents) and worldStats.activeComponents > 0
+      and elapsed / worldStats.activeComponents or nil
+    for _, runtime in ipairs(studio.runtimes) do
+      if runtime.enabled then runtime.testSolverTimeMs = share end
+    end
+  end
+  if studio.ui and studio.ui.open and studio.tickCount % 5 == 0 then
     local data = {}
     for _, runtime in ipairs(studio.runtimes) do
       data[runtime.componentId] = { links = runtime.diagnostics, gravityFrameAvailable = runtime.gravityFrameAvailable == true }
     end
+    data.__world = studio.worldDiagnostics
     studio.ui:setDiagnostics(data)
   end
   if studio.testCapture and type(studio.testPostTick) == "function" then
@@ -994,6 +1112,12 @@ function studio.postRender()
       else
         runtime.collisionContext.enabled = false
       end
+    else
+      runtime.gravityFrameAvailable = false
+      runtime.rotationFrameAvailable = false
+      runtime.collisionContext.frameAvailable = false
+      runtime.collisionContext.enabled = false
+      runtime.collisionContext.worldUnavailable = true
     end
   end
 end
@@ -1026,8 +1150,10 @@ function studio.render(delta)
   if studio.gizmos.visible and studio.ui and studio.ui.open then
     local component = studio.ui:selection()
     local selectedKey = component and registryApi.pathKey(component.rootPath) or nil
-    if studio.gizmos.chainsRef ~= studio.runtimes or studio.gizmos.selectedRootKey ~= selectedKey then
-      gizmosApi.setVisible(studio.gizmos, studio.runtimes, true, selectedKey)
+    if studio.gizmos.chainsRef ~= studio.runtimes or studio.gizmos.selectedRootKey ~= selectedKey
+      or studio.gizmos.settingsRef ~= studio.draftConfig then
+      gizmosApi.setVisible(studio.gizmos, studio.runtimes, true, selectedKey, studio.registry,
+        studio.draftConfig and studio.draftConfig.colliders, studio.draftConfig)
     end
   end
 end
@@ -1071,7 +1197,8 @@ register("KEY_PRESS", function(key, action, modifier)
     and tonumber(modifier) and tonumber(modifier) % (GLFW_MOD_SHIFT * 2) == GLFW_MOD_SHIFT then
     if not studio.initialized then initialize() end
     if studio.initialized then
-      gizmosApi.setVisible(studio.gizmos, studio.runtimes, not studio.gizmos.visible, currentSelectedRoot())
+      gizmosApi.setVisible(studio.gizmos, studio.runtimes, not studio.gizmos.visible, currentSelectedRoot(),
+        studio.registry, studio.draftConfig and studio.draftConfig.colliders, studio.draftConfig)
     end
     return true
   end

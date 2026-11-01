@@ -1,11 +1,12 @@
 local uiApi = {}
 local configApi = require("physics_bone_config")
-local BUILD_VERSION = "2.3.9"
+local worldApi = require("physics_bone_world")
+local BUILD_VERSION = "2.4.1"
 
 local PARAMS = {
   { group = "Движение" },
   { path = "pull", label = "Возврат к анимации", help = "Тянет звенья к текущей анимационной позе. Высокое значение удерживает её изгиб и мешает хвосту отставать; низкое даёт больше инерции, но возвращение медленнее.", min = 0, max = 500, step = 0.05, nudge = 1, decimals = 2, curve = 3 },
-  { path = "spring", label = "Пружина", help = "Упругость возврата; выше — заметнее отскок.", min = 0, max = 1, step = 0.02, decimals = 2 },
+  { path = "spring", label = "Упругость", help = "Доля скорости, возвращаемая при проходе сквозь целевую позу: 0 — без отскока, 1 — упругий отскок. Не меняет затухание.", min = 0, max = 1, step = 0.02, decimals = 2 },
   { path = "damping", label = "Затухание", help = "Гасит остаточное движение и дрожание; слишком высокое значение делает реакцию вялой.", min = 0, max = 24, step = 0.25, decimals = 2 },
   { path = "mass", label = "Масса", help = "Инерция звена; выше — силам сложнее его разогнать.", min = 0.05, max = 20, step = 0.05, decimals = 2 },
   { path = "tipMass", label = "Масса кончика", help = "Постепенно увеличивает инерцию к концу цепи. Выше — кончик сильнее отстаёт при разгоне и смене направления.", min = 1, max = 6, step = 0.1, decimals = 1, suffix = "×" },
@@ -33,6 +34,8 @@ local PARAMS = {
   { path = "collision.avatar", label = "Коллайдеры аватара", help = "Учитывает сферы и капсулы, привязанные к частям модели.", choices = { false, true }, names = { [false] = "Выкл", [true] = "Вкл" } },
   { path = "collision.world", label = "Блоки мира", help = "Столкновение с collision-shape блоков; число проверок ограничено лимитом ниже.", choices = { false, true }, names = { [false] = "Выкл", [true] = "Вкл" } },
   { path = "collision.self", label = "Самостолкновение", help = "Не даёт несоседним звеньям одной цепи проходить друг через друга.", choices = { false, true }, names = { [false] = "Выкл", [true] = "Вкл" } },
+  { path = "collision.selfNeighborDepth", label = "Исключить соседей", help = "Сколько рёбер графа исключать из self-collision от каждой точки. 1 исключает только прямо соединённые точки.", min = 0, max = 8, step = 1, decimals = 0 },
+  { path = "collision.group", label = "Группа столкновений", help = "Категория этой цепочки для глобальной матрицы взаимодействий.", choices = { "body", "hair", "ears", "tail", "clothing", "accessories", "custom" }, names = { body = "Тело", hair = "Волосы", ears = "Уши", tail = "Хвост", clothing = "Одежда", accessories = "Аксессуары", custom = "Своя" } },
   { path = "collision.radius", label = "Радиус звена", help = "Толщина каждой симулируемой точки в единицах модели.", min = 0.05, max = 16, step = 0.1, decimals = 2 },
   { path = "collision.friction", label = "Трение контакта", help = "Насколько быстро гасит движение вдоль поверхности после удара.", min = 0, max = 1, step = 0.02, decimals = 2 },
   { path = "collision.restitution", label = "Упругость контакта", help = "Доля скорости, возвращаемая при отскоке от поверхности.", min = 0, max = 1, step = 0.02, decimals = 2 },
@@ -46,6 +49,8 @@ local PARAMS = {
 }
 
 local BASIC_PARAMS = {
+  { path = "animationTargetMode", label = "Цель анимации", help = "«Анимация» точно следует текущим ключам; «Гибрид» смешивает ключи и физику; «Поза покоя» использует сохранённую калибровку.", choices = { "animation", "hybrid", "rest" }, names = { animation = "Анимация", hybrid = "Гибрид", rest = "Поза покоя" } },
+  { path = "animationInfluence", label = "Влияние анимации", help = "Насколько физическая цель следует текущим ключам: 100% — полностью, ниже — меньше движения от анимации.", min = 0, max = 1, step = 0.05, nudge = 0.1, decimals = 2 },
   { path = "gravitySpace", label = "Гравитация направлена", help = "«Вниз по миру» тянет к земле, даже если тело перевёрнуто. «Вместе с цепью» вращает направление вниз вместе с родительской костью.", choices = { "world", "local" }, names = { world = "Вниз по миру", ["local"] = "Вместе с цепью" } },
   { path = "@gravityStrength", basicField = "gravityStrength", label = "Сила тяжести", help = "1× — базовая земная тяжесть (9.81 в технических настройках). Если кость крепко держится за анимацию, уменьши «Следование анимации», чтобы увидеть действие гравитации.", min = 0, max = 3, step = 0.05, nudge = 0.1, decimals = 1, suffix = "×" },
   { path = "@gravityTiltResponse", basicField = "gravityTiltResponse", label = "Компенсация в покое", help = "Уравновешивает тяжесть в начальной позе, чтобы уши не провисали. При наклоне родителя мировая гравитация продолжает отклонять цепь. Для этого выбери «Вниз по миру».", min = 0, max = 100, step = 1, nudge = 5, decimals = 0, suffix = "%" },
@@ -60,6 +65,7 @@ local COLLIDER_PARAMS = {
   { group = "Форма коллайдера" },
   { path = "enabled", label = "Коллайдер", help = "Включает выбранную сферу или капсулу.", choices = { false, true }, names = { [false] = "Выкл", [true] = "Вкл" }, collider = true },
   { path = "shape", label = "Форма", help = "Сфера или капсула; капсула направлена по заданной локальной оси.", choices = { "sphere", "capsule" }, names = { sphere = "Сфера", capsule = "Капсула" }, collider = true },
+  { path = "group", label = "Группа", help = "Категория формы для матрицы столкновений.", choices = { "body", "hair", "ears", "tail", "clothing", "accessories", "custom" }, names = { body = "Тело", hair = "Волосы", ears = "Уши", tail = "Хвост", clothing = "Одежда", accessories = "Аксессуары", custom = "Своя" }, collider = true },
   { path = "radius", label = "Радиус", help = "Радиус формы в единицах модели.", min = 0.05, max = 16, step = 0.1, decimals = 2, collider = true },
   { path = "height", label = "Высота капсулы", help = "Длина средней части капсулы без сферических концов.", min = 0, max = 64, step = 0.25, decimals = 2, collider = true },
   { group = "Позиция и ось" },
@@ -69,6 +75,27 @@ local COLLIDER_PARAMS = {
   { path = "axis.x", label = "Ось X", help = "Направление капсулы в локальных координатах выбранной части.", min = -1, max = 1, step = 0.05, decimals = 2, collider = true },
   { path = "axis.y", label = "Ось Y", help = "Направление капсулы в локальных координатах выбранной части.", min = -1, max = 1, step = 0.05, decimals = 2, collider = true },
   { path = "axis.z", label = "Ось Z", help = "Направление капсулы в локальных координатах выбранной части.", min = -1, max = 1, step = 0.05, decimals = 2, collider = true },
+}
+
+local WORLD_PARAMS = {
+  { path = "fixedStep", label = "Шаг симуляции", help = "Фиксированный шаг общего решателя в секундах.", min = 0.0083, max = 0.05, step = 0.001, decimals = 4, world = true },
+  { path = "maxSubsteps", label = "Шаги за тик", help = "Максимум подшагов симуляции за игровой тик.", min = 1, max = 5, step = 1, decimals = 0, world = true },
+  { path = "maxFrameDt", label = "Ограничение кадра", help = "Максимальный dt, принимаемый после задержки кадра.", min = 0.0167, max = 0.25, step = 0.01, decimals = 3, world = true },
+  { path = "maxPoints", label = "Бюджет точек", help = "Общий максимум динамических точек всех компонентов.", min = 1, max = 512, step = 1, decimals = 0, world = true },
+  { path = "maxCandidatePairs", label = "Бюджет пар", help = "Общий максимум динамических контактов на тик.", min = 0, max = 4096, step = 16, decimals = 0, world = true },
+  { path = "contactIterations", label = "Проходы контакта", help = "Проходы разрешения динамических столкновений.", min = 1, max = 4, step = 1, decimals = 0, world = true },
+  { path = "maxBlockQueries", label = "Блоков за тик", help = "Единый лимит запросов collision-shape блоков для всех компонентов.", min = 0, max = 256, step = 4, decimals = 0, world = true },
+  { path = "segmentMode", label = "Контакт звеньев", help = "Текущий уровень контактов между сегментами разных цепей.", choices = { "point_segment", "segment_segment" }, names = { point_segment = "Точка-сегмент", segment_segment = "Сегмент-сегмент" }, world = true },
+}
+
+local PAGES = {
+  { id = "overview", label = "Обзор" },
+  { id = "components", label = "Компоненты" },
+  { id = "colliders", label = "Коллайдеры" },
+  { id = "groups", label = "Группы" },
+  { id = "physics", label = "Физика" },
+  { id = "performance", label = "Производительность" },
+  { id = "diagnostics", label = "Диагностика" },
 }
 
 local function parameterHelp(path)
@@ -267,13 +294,15 @@ end
 function uiApi.new(registry, draft, callbacks)
   return setmetatable({
     registry = registry, draft = configApi.clone(draft or configApi.defaults()), callbacks = callbacks or {}, open = false,
+    page = "components",
     visible = false, selectedKey = registry and registry.flat[1] and registry.flat[1].key or nil,
     collapsed = {}, search = "", searchFocused = false, treeOffset = 0, detailsOffset = 0,
     advancedSettings = false,
     graphs = {}, status = "Выбери GROUP и создай компонент PhysBone.",
     diagnosticsData = {},
     hover = nil, dragging = nil, editing = nil, cursorWasUnlocked = nil,
-    activeComponentId = nil, colliderMode = false, selectedColliderId = nil,
+    activeComponentId = nil, colliderMode = false, selectedColliderId = nil, colliderScope = "component",
+    presetChoices = {},
     hud = nil, treeText = nil, detailsText = nil, messageText = nil,
     treeRows = {}, settingRows = {}, actionRows = {}, lineHeight = nil,
   }, { __index = uiApi })
@@ -335,10 +364,16 @@ function uiApi:selection()
 end
 
 function uiApi:selectedCollider()
+  if self.colliderScope == "global" and self.selectedColliderId then
+    for index, collider in ipairs(self.draft.colliders or {}) do
+      if collider.id == self.selectedColliderId then return collider, index, self.draft, "global" end
+    end
+    return nil
+  end
   local component = self:selection()
   if not component or not self.selectedColliderId then return nil end
   for index, collider in ipairs(component.colliders or {}) do
-    if collider.id == self.selectedColliderId then return collider, index, component end
+    if collider.id == self.selectedColliderId then return collider, index, component, "component" end
   end
   return nil
 end
@@ -488,9 +523,81 @@ local function settingValue(settings, spec)
   return getPath(settings, spec.path)
 end
 
+local function appendPageSettings(ui, lines, specs, settings, rightWidth)
+  local maxLabelWidth, valueWidth = 0, 5
+  for _, spec in ipairs(specs or {}) do
+    if spec.group then maxLabelWidth = math.max(maxLabelWidth, textWidth(spec.group))
+    else
+      maxLabelWidth = math.max(maxLabelWidth, textWidth(spec.label))
+      if not spec.choices then
+        valueWidth = math.max(valueWidth, textWidth(formatNumber(settingValue(settings, spec) or spec.min, spec.decimals)))
+      end
+    end
+  end
+  local labelWidth = math.min(maxLabelWidth, math.max(8, math.floor(rightWidth * 0.34)))
+  local controlStart = labelWidth + 2
+  local segments = math.max(4, math.min(12, math.floor((rightWidth - controlStart - valueWidth - 11) / math.max(1, textWidth("■")))))
+  for _, spec in ipairs(specs or {}) do
+    if spec.group then
+      lines[#lines + 1] = "§6" .. spec.group
+    else
+      local value = settingValue(settings, spec)
+      if value == nil and not spec.choices then value = spec.min end
+      local hoverKind = ui.hover and ui.hover.path == spec.path and ui.hover.kind or nil
+      local controls, bounds = nil, nil
+      if spec.choices then
+        local label = spec.names[value] or tostring(value)
+        controls = (hoverKind == "choice" and "§b" or "§8") .. "[‹] §f" .. label .. " §8[›]"
+        bounds = { choiceStart = controlStart, choiceEnd = controlStart + textWidth(controls) }
+      else
+        local number = tonumber(value) or spec.min
+        local ratio = sliderRatio(spec, number)
+        local filled = math.max(0, math.min(segments, math.floor(ratio * segments + 0.5)))
+        local minusStart = controlStart
+        local valueStart = minusStart + textWidth("[−] ")
+        local plusStart = valueStart + valueWidth + textWidth(" [+] ")
+        local trackStart = plusStart + textWidth("[+] [")
+        local trackEnd = trackStart + segments * textWidth("■")
+        controls = (hoverKind == "minus" and "§b" or "§8") .. "[−] "
+          .. (hoverKind == "value" and "§b" or "§f") .. padLeft(formatNumber(number, spec.decimals), valueWidth)
+          .. " " .. (hoverKind == "plus" and "§b" or "§a") .. "[+] "
+          .. (hoverKind == "slider" and "§a" or "§b") .. "[" .. string.rep("■", filled)
+          .. string.rep("·", segments - filled) .. "]"
+        bounds = { minusStart = minusStart - 1, minusEnd = valueStart - 1,
+          valueStart = valueStart, valueEnd = valueStart + valueWidth,
+          plusStart = valueStart + valueWidth + 1, plusEnd = trackStart - 1,
+          sliderStart = trackStart, sliderEnd = trackEnd, sliderHitStart = trackStart - 1, sliderHitEnd = trackEnd + 1 }
+      end
+      local label = padRight(truncateToWidth(spec.label, labelWidth), labelWidth)
+      lines[#lines + 1] = (ui.hover and ui.hover.path == spec.path and "§b" or "§f") .. label .. " §r" .. controls
+      local row = { spec = spec, settings = settings, line = #lines,
+        choiceStart = bounds.choiceStart or controlStart, choiceEnd = bounds.choiceEnd or controlStart,
+        minusStart = bounds.minusStart or controlStart, minusEnd = bounds.minusEnd or controlStart,
+        valueStart = bounds.valueStart or controlStart, valueEnd = bounds.valueEnd or controlStart,
+        plusStart = bounds.plusStart or controlStart, plusEnd = bounds.plusEnd or controlStart,
+        sliderStart = bounds.sliderStart or controlStart, sliderEnd = bounds.sliderEnd or controlStart,
+        sliderHitStart = bounds.sliderHitStart or controlStart, sliderHitEnd = bounds.sliderHitEnd or controlStart }
+      ui.settingRows[#ui.settingRows + 1] = row
+    end
+  end
+end
+
 function uiApi:writeSetting(spec, value)
   local component, _, linkKey = self:selection()
-  if not component then return end
+  if spec.world then
+    self.draft.world = self.draft.world or {}
+    if spec.path == "performance" then
+      local profile = worldApi.performanceOptions(value)
+      for key, profileValue in pairs(profile) do
+        if key ~= "performance" then self.draft.world[key] = profileValue end
+      end
+      self.draft.world.performance = profile.performance
+    else
+      setPath(self.draft.world, spec.path, value)
+    end
+    self:changed("Настройка PhysicsWorld изменена; нажми «Сохранить».")
+    return
+  end
   if spec.collider then
     local collider = self:selectedCollider()
     if not collider then return end
@@ -498,6 +605,7 @@ function uiApi:writeSetting(spec, value)
     self:changed("Параметр коллайдера изменён; нажми «Сохранить».")
     return
   end
+  if not component then return end
   if spec.endpoint then
     component.endpoint = component.endpoint or { mode = "manual", vector = { x = 0, y = -1, z = 0 } }
     component.endpoint.mode = "manual"
@@ -579,6 +687,64 @@ function uiApi:createComponent()
   self:changed("Создан компонент " .. node.name .. ". Проверь звенья справа и сохрани.")
 end
 
+function uiApi:selectedPresetChoice(component)
+  if not component then return nil end
+  local presets = configApi.presetsForKind(component.kind)
+  local selected = self.presetChoices[component.id] or component.presetId
+  for _, preset in ipairs(presets) do if preset.id == selected then return preset.id end end
+  return presets[1] and presets[1].id or nil
+end
+
+function uiApi:cycleComponentKind(direction)
+  local component = self:selection()
+  if not component then return false end
+  local kinds = configApi.componentKinds()
+  local index = 1
+  for candidate, kind in ipairs(kinds) do if kind.id == component.kind then index = candidate; break end end
+  index = ((index - 1 + (tonumber(direction) or 1)) % #kinds) + 1
+  component.kind = kinds[index].id
+  component.settings = component.settings or {}
+  component.settings.collision = component.settings.collision or {}
+  component.settings.collision.group = component.kind
+  local presets = configApi.presetsForKind(component.kind)
+  self.presetChoices[component.id] = presets[1] and presets[1].id or nil
+  self:changed("Тип компонента: " .. kinds[index].label .. ". Выбери стартовый профиль и примени его при необходимости.")
+  return true
+end
+
+function uiApi:cycleComponentPreset(direction)
+  local component = self:selection()
+  if not component then return false end
+  local presets = configApi.presetsForKind(component.kind)
+  if #presets == 0 then
+    self.status = "Для этого типа нет стартовых профилей; настрой параметры вручную."
+    self:refresh()
+    return false
+  end
+  local selected = self:selectedPresetChoice(component)
+  local index = 1
+  for candidate, preset in ipairs(presets) do if preset.id == selected then index = candidate; break end end
+  index = ((index - 1 + (tonumber(direction) or 1)) % #presets) + 1
+  self.presetChoices[component.id] = presets[index].id
+  self.status = "Выбран профиль «" .. presets[index].label .. ". Нажми «Применить профиль», чтобы заменить базовые параметры компонента."
+  self:refresh()
+  return true
+end
+
+function uiApi:applyComponentPreset()
+  local component = self:selection()
+  local presetId = self:selectedPresetChoice(component)
+  if not component or not presetId then
+    self.status = "Для выбранного типа нет стартового профиля."
+    self:refresh()
+    return false
+  end
+  local ok, label = configApi.applyPreset(component, presetId)
+  if not ok then self.status = label; self:refresh(); return false end
+  self:changed("Применён стартовый профиль «" .. label .. ". Параметры можно менять отдельно.")
+  return true
+end
+
 function uiApi:removeComponent()
   local component, index = self:selection()
   if not index then self.status = "Выбери корень назначенного компонента."; self:refresh(); return end
@@ -592,32 +758,42 @@ end
 function uiApi:createCollider()
   local node = self:selectedNode()
   local component = self:selection()
-  if not component then self.status = "Сначала выбери компонент физики, затем выбери часть модели слева."; self:refresh(); return end
   if not node or not node.transformable then self.status = "Коллайдер можно привязать только к трансформируемой GROUP."; self:refresh(); return end
-  component.colliders = component.colliders or {}
   local id = pathKey(node.path)
-  for _, collider in ipairs(component.colliders) do
+  local useGlobal = self.page == "colliders"
+  if not useGlobal and not component then
+    self.status = "На странице «Коллайдеры» форма станет общей для всех компонентов."
+    self.page = "colliders"
+    self:refresh()
+    return
+  end
+  local owner = useGlobal and self.draft or component
+  owner.colliders = owner.colliders or {}
+  for _, collider in ipairs(owner.colliders) do
     if collider.id == id then
       self.selectedColliderId, self.colliderMode = collider.id, true
+      self.colliderScope = useGlobal and "global" or "component"
       self.status = "Коллайдер этой части уже есть; выбрана его настройка."
       self:refresh()
       return
     end
   end
-  component.colliders[#component.colliders + 1] = {
+  owner.colliders[#owner.colliders + 1] = {
     id = id, path = configApi.clone(node.path), enabled = true, shape = "sphere",
+    group = "body", mask = {},
     offset = { x = 0, y = 0, z = 0 }, axis = { x = 0, y = 1, z = 0 },
     radius = 1.5, height = 4,
   }
-  self.activeComponentId = component.id
+  if component then self.activeComponentId = component.id end
+  self.colliderScope = useGlobal and "global" or "component"
   self.selectedColliderId, self.colliderMode = id, true
   self:changed("Добавлена сфера-коллайдер на " .. node.name .. ". Настрой её справа и сохрани.")
 end
 
 function uiApi:removeCollider()
-  local collider, index, component = self:selectedCollider()
-  if not collider or not index or not component then return end
-  table.remove(component.colliders, index)
+  local collider, index, owner = self:selectedCollider()
+  if not collider or not index or not owner then return end
+  table.remove(owner.colliders, index)
   self.selectedColliderId = nil
   self.colliderMode = false
   self:changed("Коллайдер удалён из черновика; нажми «Сохранить».")
@@ -714,7 +890,7 @@ function uiApi:refresh()
   local isGroup = self:selectedNode() and self:selectedNode().transformable
   treeLines[#treeLines + 1] = (isGroup and "§a" or "§8") .. "Создать PhysBone"
   treeLines[#treeLines + 1] = (component and "§c" or "§8") .. "Удалить компонент"
-  treeLines[#treeLines + 1] = (component and isGroup and "§b" or "§8") .. "Добавить коллайдер"
+  treeLines[#treeLines + 1] = (isGroup and (component or self.page == "colliders") and "§b" or "§8") .. "Добавить коллайдер"
   treeLines[#treeLines + 1] = "§7F8 — закрыть"
   if self.treeText then safeCall(self.treeText, "setText", table.concat(treeLines, "\n")) end
   self.actionRows = { create = #treeLines - 3, remove = #treeLines - 2, collider = #treeLines - 1, close = #treeLines }
@@ -726,8 +902,15 @@ function uiApi:refresh()
   self.settingRows = {}
   self.colliderRows = {}
   self.branchRows = {}
+  self.groupRows = {}
   self.detailActions = {}
-  if component then
+  local pageIndex = 1
+  for index, page in ipairs(PAGES) do if page.id == self.page then pageIndex = index; break end end
+  local currentPage = PAGES[pageIndex]
+  detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "page-nav" and "§b" or "§e")
+    .. "[‹] §f" .. currentPage.label .. " §e[›]"
+  self.detailActions.pageNav = #detailLines
+  if self.page == "components" and component then
     local selectedNode = self:selectedNode()
     local partPath = selectedNode and table.concat((function()
       local parts = {}; for _, segment in ipairs(selectedNode.path or {}) do parts[#parts + 1] = segment.name end; return parts
@@ -736,6 +919,23 @@ function uiApi:refresh()
     local hoveredEnable = self.hover and self.hover.kind == "component-enabled"
     detailLines[#detailLines + 1] = (hoveredEnable and "§b" or "§e") .. "Компонент: " .. (component.enabled == false and "ВЫКЛ" or "ВКЛ") .. " [клик]"
     self.detailActions.enabled = #detailLines
+    detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "component-kind" and "§b" or "§e")
+      .. "Тип: " .. configApi.componentKindLabel(component.kind) .. " [сменить]"
+    self.detailActions.componentKind = #detailLines
+    local componentPresets = configApi.presetsForKind(component.kind)
+    local selectedPresetId = self:selectedPresetChoice(component)
+    local selectedPresetLabel = "нет профиля"
+    for _, preset in ipairs(componentPresets) do
+      if preset.id == selectedPresetId then selectedPresetLabel = preset.label; break end
+    end
+    detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "component-preset" and "§b" or (#componentPresets > 0 and "§e" or "§8"))
+      .. "Стартовый профиль: " .. selectedPresetLabel .. (#componentPresets > 0 and " [выбрать]" or "")
+    self.detailActions.componentPreset = #componentPresets > 0 and #detailLines or nil
+    if #componentPresets > 0 then
+      detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "apply-component-preset" and "§b" or "§a")
+        .. "Применить профиль к компоненту"
+      self.detailActions.applyComponentPreset = #detailLines
+    else self.detailActions.applyComponentPreset = nil end
     detailLines[#detailLines + 1] = "§7Звеньев: " .. tostring(graph and #graph.links or 0)
       .. " | ветви: " .. (component.branchMode == "all" and "все" or "выбранные") .. " [перекл.]"
     self.detailActions.branches = #detailLines
@@ -757,6 +957,11 @@ function uiApi:refresh()
     detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "endpoint-mode" and "§b" or "§e")
       .. "Конечная точка: " .. ((component.endpoint and component.endpoint.mode == "manual") and "ручная" or "дочерний pivot") .. " [перекл.]"
     self.detailActions.endpointMode = #detailLines
+    detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "capture-rest-pose" and "§b" or "§e")
+      .. (component.restPose and "Перекалибровать позу покоя" or "Сохранить позу покоя")
+      .. " [в нейтральной позе]"
+    self.detailActions.captureRestPose = #detailLines
+    detailLines[#detailLines + 1] = "§8Поза покоя нужна режимам «Гибрид» и «Поза покоя»."
     local settings, _, _, hasOverride = self:settingsForSelected()
     local defaultSettings = configApi.defaultsForComponent(component.rootPath).settings
     self.linkOverride = hasOverride
@@ -781,7 +986,7 @@ function uiApi:refresh()
         detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "collider-row" and self.hover.id == collider.id and "§b"
           or (selected and "§a" or "§f")) .. "  " .. label .. " · " .. (collider.shape == "capsule" and "капсула" or "сфера")
           .. (collider.enabled == false and " §8ВЫКЛ" or " §aВКЛ")
-        self.colliderRows[#self.colliderRows + 1] = { line = #detailLines, id = collider.id }
+        self.colliderRows[#self.colliderRows + 1] = { line = #detailLines, id = collider.id, scope = "component" }
       end
     end
     if self.colliderMode and selectedCollider then
@@ -948,6 +1153,102 @@ function uiApi:refresh()
     self.detailActions.resetLink = #detailLines
     detailLines[#detailLines + 1] = "§eСброс компонента"
     self.detailActions.reset = #detailLines
+  elseif self.page == "overview" then
+    local enabled, points, links = 0, 0, 0
+    for index, item in ipairs(self.draft.components or {}) do
+      if item.enabled ~= false then enabled = enabled + 1 end
+      local itemGraph = self.graphs[index]
+      links = links + (itemGraph and #(itemGraph.links or {}) or 0)
+      points = points + (itemGraph and tonumber(itemGraph.pointCount) or 0)
+    end
+    local stats = self.diagnosticsData.__world or {}
+    detailLines[#detailLines + 1] = "§6Система"
+    detailLines[#detailLines + 1] = "§7Компоненты: §f" .. tostring(#(self.draft.components or {})) .. " §7(вкл. §f" .. tostring(enabled) .. "§7)"
+    detailLines[#detailLines + 1] = "§7Звенья: §f" .. tostring(links) .. " §7| точки графа: §f" .. tostring(points)
+    detailLines[#detailLines + 1] = "§7Профиль мира: §f" .. tostring(self.draft.world.performance or "balanced")
+    detailLines[#detailLines + 1] = "§7Общие коллайдеры: §f" .. tostring(#(self.draft.colliders or {}))
+    detailLines[#detailLines + 1] = "§6Последний шаг физики"
+    detailLines[#detailLines + 1] = "§7Подшаги: §f" .. tostring(stats.substeps or 0) .. " §7| точки: §f" .. tostring(stats.activePoints or 0)
+    detailLines[#detailLines + 1] = "§7Контакты: §f" .. tostring(stats.resolvedContacts or 0) .. " §7| время: §f" .. formatNumber(stats.frameTimeMs or 0, 3) .. " ms"
+    detailLines[#detailLines + 1] = "§7Выбери страницу стрелками сверху. Профиль сохраняется вместе с аватаром."
+  elseif self.page == "colliders" then
+    detailLines[#detailLines + 1] = "§6Общие формы тела — доступны всем компонентам"
+    detailLines[#detailLines + 1] = "§7Выбери GROUP в Outliner и нажми «Добавить коллайдер»."
+    local selectedCollider, selectedIndex = self:selectedCollider()
+    for index, collider in ipairs(self.draft.colliders or {}) do
+      local node = nodeMatches(self.registry, collider.path)
+      local label = node and node.name or "путь не найден"
+      local selected = self.colliderScope == "global" and self.selectedColliderId == collider.id
+      detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "collider-row" and self.hover.id == collider.id and "§b"
+        or (selected and "§a" or "§f")) .. label .. " · " .. (collider.shape == "capsule" and "капсула" or "сфера")
+        .. (collider.enabled == false and " §8ВЫКЛ" or " §aВКЛ")
+      self.colliderRows[#self.colliderRows + 1] = { line = #detailLines, id = collider.id, scope = "global" }
+    end
+    if #self.draft.colliders == 0 then detailLines[#detailLines + 1] = "§8Общих коллайдеров пока нет." end
+    if selectedCollider and self.colliderScope == "global" then
+      detailLines[#detailLines + 1] = (self.hover and self.hover.kind == "remove-collider" and "§b" or "§c") .. "Удалить выбранную общую форму"
+      self.detailActions.removeCollider = #detailLines
+      appendPageSettings(self, detailLines, COLLIDER_PARAMS, selectedCollider, self.layout.rightWidth)
+    elseif not selectedCollider and #self.draft.colliders > 0 then
+      detailLines[#detailLines + 1] = "§8Нажми на строку формы, чтобы редактировать её."
+    end
+    if selectedIndex then self.colliderMode = true end
+  elseif self.page == "groups" then
+    local groups = { "body", "hair", "ears", "tail", "clothing", "accessories", "custom" }
+    local names = { body = "Тело", hair = "Волосы", ears = "Уши", tail = "Хвост", clothing = "Одежда", accessories = "Аксессуары", custom = "Своя" }
+    detailLines[#detailLines + 1] = "§6Матрица взаимодействия PhysBone"
+    detailLines[#detailLines + 1] = "§8Клик по ячейке включает/выключает пару групп."
+    local matrix = self.draft.world.collisionMatrix or {}
+    for _, first in ipairs(groups) do
+      local start = textWidth(names[first] .. "  ")
+      local rowText = "§f" .. names[first] .. "  "
+      for _, second in ipairs(groups) do
+        local enabled = not (matrix[first] and matrix[first][second] == false)
+        local hovered = self.hover and self.hover.kind == "group-cell" and self.hover.first == first and self.hover.second == second
+        local symbol = enabled and "●" or "○"
+        rowText = rowText .. (hovered and "§b" or (enabled and "§a" or "§8")) .. symbol
+        self.groupRows[#self.groupRows + 1] = { line = #detailLines + 1, first = first, second = second,
+          start = start, finish = start + textWidth(symbol) + 1 }
+        start = start + textWidth(symbol .. " ")
+        rowText = rowText .. " "
+      end
+      detailLines[#detailLines + 1] = rowText
+    end
+    detailLines[#detailLines + 1] = "§8Порядок групп: Тело, Волосы, Уши, Хвост, Одежда, Аксессуары, Своя."
+  elseif self.page == "physics" then
+    detailLines[#detailLines + 1] = "§6Параметры общего решателя"
+    appendPageSettings(self, detailLines, WORLD_PARAMS, self.draft.world, self.layout.rightWidth)
+    detailLines[#detailLines + 1] = "§8Это глобальные лимиты и шаг мира, не силы отдельного PhysBone."
+  elseif self.page == "performance" then
+    detailLines[#detailLines + 1] = "§6Профиль качества"
+    local performanceSpec = { path = "performance", label = "Режим", help = "Готовая конфигурация общих лимитов.",
+      choices = { "performance", "balanced", "quality" }, names = { performance = "Производительность", balanced = "Сбалансированный", quality = "Качество" }, world = true }
+    appendPageSettings(self, detailLines, { performanceSpec }, self.draft.world, self.layout.rightWidth)
+    detailLines[#detailLines + 1] = "§7Профиль меняет лимиты ниже; их можно настроить вручную на странице «Физика»."
+    local stats = self.diagnosticsData.__world or {}
+    detailLines[#detailLines + 1] = "§6Активная нагрузка"
+    detailLines[#detailLines + 1] = "§7Точек: §f" .. tostring(stats.activePoints or 0) .. " / " .. tostring(stats.maxPoints or self.draft.world.maxPoints or 0)
+    detailLines[#detailLines + 1] = "§7Пар: §f" .. tostring(stats.candidatePairs or 0) .. " / " .. tostring(stats.maxCandidatePairs or self.draft.world.maxCandidatePairs or 0)
+    detailLines[#detailLines + 1] = "§7Блок-запросы: §f" .. tostring(stats.worldQueries or 0) .. " / " .. tostring(stats.worldQueryBudget or self.draft.world.maxBlockQueries or 0)
+  elseif self.page == "diagnostics" then
+    local stats = self.diagnosticsData.__world or {}
+    detailLines[#detailLines + 1] = "§6Общий PhysicsWorld"
+    detailLines[#detailLines + 1] = "§7Профиль: §f" .. tostring(stats.performance or self.draft.world.performance or "—")
+    detailLines[#detailLines + 1] = "§7Компоненты/звенья: §f" .. tostring(stats.activeComponents or 0) .. " / " .. tostring(stats.activePoints or 0)
+    detailLines[#detailLines + 1] = "§7Сегменты: §f" .. tostring(stats.activeSegments or 0) .. " §7| шаги: §f" .. tostring(stats.substeps or 0)
+    detailLines[#detailLines + 1] = "§7Кандидаты/контакты: §f" .. tostring(stats.candidatePairs or 0) .. " / " .. tostring(stats.resolvedContacts or 0)
+    detailLines[#detailLines + 1] = "§7Локальные контакты/self пары: §f" .. tostring(stats.localContacts or 0) .. " / " .. tostring(stats.selfPairs or 0)
+    detailLines[#detailLines + 1] = "§7Запросы блоков: §f" .. tostring(stats.worldQueries or 0) .. " / " .. tostring(stats.worldQueryBudget or 0)
+    detailLines[#detailLines + 1] = "§7Время шага: §f" .. formatNumber(stats.frameTimeMs or 0, 3) .. " ms"
+    local warnings = {}
+    if stats.budgetExceeded then warnings[#warnings + 1] = "динамический бюджет исчерпан" end
+    if stats.pointBudgetExceeded then warnings[#warnings + 1] = "превышен лимит точек" end
+    if stats.blockBudgetExceeded then warnings[#warnings + 1] = "лимит блоков исчерпан" end
+    if stats.selfBudgetExceeded then warnings[#warnings + 1] = "лимит self-контактов исчерпан" end
+    if stats.worldUnavailable then warnings[#warnings + 1] = "API блоков недоступен" end
+    detailLines[#detailLines + 1] = #warnings > 0 and ("§cПредупреждения: " .. table.concat(warnings, ", ")) or "§aБюджеты соблюдены; ошибок контактов нет."
+    local selectedData = component and self.diagnosticsData[component.id]
+    if selectedData then detailLines[#detailLines + 1] = "§7Выбранный компонент: мировой кадр " .. (selectedData.gravityFrameAvailable and "§aдоступен" or "§cнедоступен") end
   else
     local excludedComponent, _, excludedIndex = self:selectedExclusion()
     if excludedComponent then
@@ -996,11 +1297,16 @@ function uiApi:targetAt(x, y)
     if line == self.actionRows.collider then return { kind = "create-collider" } end
     if line == self.actionRows.close then return { kind = "close" } end
   else
+    if line == self.detailActions.pageNav then return { kind = "page-nav" } end
     if line == self.detailActions.settingsMode then return { kind = "settings-mode" } end
     if line == self.detailActions.enabled then return { kind = "component-enabled" } end
+    if line == self.detailActions.componentKind then return { kind = "component-kind" } end
+    if line == self.detailActions.componentPreset then return { kind = "component-preset" } end
+    if line == self.detailActions.applyComponentPreset then return { kind = "apply-component-preset" } end
     if line == self.detailActions.branches then return { kind = "branches" } end
     if line == self.detailActions.override then return { kind = "override" } end
     if line == self.detailActions.endpointMode then return { kind = "endpoint-mode" } end
+    if line == self.detailActions.captureRestPose then return { kind = "capture-rest-pose" } end
     if line == self.detailActions.exclude then return { kind = "exclude-link" } end
     if line == self.detailActions.restoreExclusion then return { kind = "restore-exclusion" } end
     if line == self.detailActions.resetLink then return { kind = "reset-link" } end
@@ -1014,7 +1320,15 @@ function uiApi:targetAt(x, y)
       if row.line == line then return { kind = "branch-choice", key = row.key, parentKey = row.parentKey } end
     end
     for _, row in ipairs(self.colliderRows or {}) do
-      if row.line == line then return { kind = "collider-row", id = row.id } end
+      if row.line == line then return { kind = "collider-row", id = row.id, scope = row.scope } end
+    end
+    for _, row in ipairs(self.groupRows or {}) do
+      if row.line == line then
+        local column = (x - self.layout.leftWidth - 8) / detailScale
+        if column >= row.start and column <= row.finish then
+          return { kind = "group-cell", first = row.first, second = row.second }
+        end
+      end
     end
     for _, row in ipairs(self.settingRows) do
       if row.line == line then
@@ -1080,7 +1394,19 @@ function uiApi:onMousePress(button, action)
   local target = self:targetAt(mouseX - self.layout.x, mouseY - self.layout.y)
   self:setHover(target)
   if not target then return true end
-  if target.kind == "search" then self.searchFocused = true; self:refresh()
+  if target.kind == "page-nav" then
+    local currentIndex = 1
+    for index, page in ipairs(PAGES) do if page.id == self.page then currentIndex = index; break end end
+    local rightX = (mouseX - (self.layout.x + self.layout.leftWidth + 8)) / (self.layout.detailScale or 1)
+    local delta = rightX < self.layout.rightWidth * 0.5 and -1 or 1
+    currentIndex = ((currentIndex - 1 + delta) % #PAGES) + 1
+    self.page = PAGES[currentIndex].id
+    self.colliderMode = false
+    if (self.page == "diagnostics" or self.page == "performance") and not self.draft.diagnostics then
+      self.draft.diagnostics = true
+      self:changed("Диагностика включена для показа счётчиков нагрузки.")
+    else self:refresh() end
+  elseif target.kind == "search" then self.searchFocused = true; self:refresh()
   elseif target.kind == "tree" then
     -- Use the rendered indentation and arrow widths with a small forgiving edge.
     local column = mouseX - self.layout.x
@@ -1105,6 +1431,9 @@ function uiApi:onMousePress(button, action)
     self:refresh()
   elseif target.kind == "component-enabled" then
     local component = self:selection(); if component then component.enabled = component.enabled == false; self:changed(component.enabled and "Компонент включён." or "Компонент выключен.") end
+  elseif target.kind == "component-kind" then self:cycleComponentKind(1)
+  elseif target.kind == "component-preset" then self:cycleComponentPreset(1)
+  elseif target.kind == "apply-component-preset" then self:applyComponentPreset()
   elseif target.kind == "branches" then self:toggleBranches()
   elseif target.kind == "branch-choice" then
     local selectedComponent = self:selection()
@@ -1135,6 +1464,9 @@ function uiApi:onMousePress(button, action)
       else selectedComponent.endpoint = { mode = "manual", vector = { x = 0, y = -1, z = 0 } } end
       self:changed("Режим конечной точки изменён.")
     end
+  elseif target.kind == "capture-rest-pose" then
+    local component = self:selection()
+    if component and self.callbacks.captureRestPose then self.callbacks.captureRestPose(component.id) end
   elseif target.kind == "reset-link" then self:resetLink()
   elseif target.kind == "reset" then self:resetComponent()
   elseif target.kind == "collider-mode" then
@@ -1147,12 +1479,22 @@ function uiApi:onMousePress(button, action)
     else self.colliderMode = false end
     self:refresh()
   elseif target.kind == "collider-row" then
+    self.colliderScope = target.scope or "component"
     if self.selectedColliderId == target.id and self.colliderMode then
       self.colliderMode = false
     else
       self.selectedColliderId, self.colliderMode = target.id, true
     end
     self:refresh()
+  elseif target.kind == "group-cell" then
+    self.draft.world.collisionMatrix = self.draft.world.collisionMatrix or {}
+    local matrix = self.draft.world.collisionMatrix
+    matrix[target.first] = matrix[target.first] or {}
+    matrix[target.second] = matrix[target.second] or {}
+    local enabled = matrix[target.first][target.second] == false
+    matrix[target.first][target.second] = enabled
+    matrix[target.second][target.first] = enabled
+    self:changed("Матрица столкновений обновлена; нажми «Сохранить».")
   elseif target.kind == "remove-collider" then self:removeCollider()
   elseif target.kind == "export" then
     if self.callbacks.export then

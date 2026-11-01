@@ -99,6 +99,51 @@ local function run()
     "self-collision must separate non-adjacent chain points")
   passed = passed + 1
 
+  local branchPoints = {
+    { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+    { x = 0, y = 0, z = 0 }, { x = 4, y = 0, z = 0 },
+  }
+  local branchPrevious = {
+    { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+    { x = 0, y = 0, z = 0 }, { x = 4, y = 0, z = 0 },
+  }
+  local branchContacts, branchPairChecks = collisions.resolveSelf(branchPoints, branchPrevious,
+    { edges = { { from = 2, to = 4 }, { from = 4, to = 3 } } },
+    { 0, 0.5, 0.5, 0.5 }, 1 / 60, {}, 32, 1)
+  assert(branchContacts == 1 and branchPairChecks == 1
+      and math.abs(branchPoints[2].x - branchPoints[3].x) >= 0.999,
+    "array-adjacent points at graph distance two must still collide")
+  passed = passed + 1
+
+  local depthPoints = {
+    { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+    { x = 4, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+  }
+  local depthPrevious = {
+    { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+    { x = 4, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+  }
+  local depthContacts, depthPairChecks = collisions.resolveSelf(depthPoints, depthPrevious,
+    { edges = { { from = 2, to = 3 }, { from = 3, to = 4 } } },
+    { 0, 0.5, 0.5, 0.5 }, 1 / 60, {}, 32, 2)
+  assert(depthContacts == 0 and depthPairChecks == 0 and depthPoints[2].x == depthPoints[4].x,
+    "configurable graph-distance depth must exclude two-hop neighbors")
+  passed = passed + 1
+
+  local directPoints = {
+    { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+    { x = 4, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+  }
+  local directPrevious = {
+    { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+    { x = 4, y = 0, z = 0 }, { x = 0, y = 0, z = 0 },
+  }
+  local directContacts, directPairChecks = collisions.resolveSelf(directPoints, directPrevious,
+    { edges = { { from = 2, to = 4 } } }, { 0, 0.5, 0.5, 0.5 }, 1 / 60, {}, 32)
+  assert(directContacts == 0 and directPairChecks == 0 and directPoints[2].x == directPoints[4].x,
+    "branched direct neighbors with nonadjacent indices must be excluded")
+  passed = passed + 1
+
   local crowdedPoints, crowdedPrevious, crowdedRadii = { { x = 0, y = 0, z = 0 } }, { { x = 0, y = 0, z = 0 } }, { 0 }
   for index = 2, 10 do
     crowdedPoints[index], crowdedPrevious[index], crowdedRadii[index] = { x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 }, 0.5
@@ -110,7 +155,7 @@ local function run()
   passed = passed + 1
 
   local defaults = config.defaults()
-  assert(defaults.components and defaults.schema == 1, "config defaults must preserve the current schema")
+  assert(defaults.components and defaults.schema == 2, "config defaults must preserve the current schema")
   local validated, warnings = config.validate({
     schema = 1,
     components = { {

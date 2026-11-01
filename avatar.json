@@ -1,0 +1,15 @@
+{
+  "name": "Deepsi — PhysBone v2 (актуальная модель)",
+  "description": "Копия текущей модели Deepsi с PhysBone v2 и упрощённой панелью F8. Исходная Physics Studio сохранена отдельно.",
+  "authors": [
+    "faska"
+  ],
+  "color": "c94f4f",
+  "autoScripts": [
+    "script",
+    "physics_bone_loader"
+  ],
+  "resources": [
+    "needsofnature/**"
+  ]
+}

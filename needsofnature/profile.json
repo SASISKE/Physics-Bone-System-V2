@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "render_non_d_bones": true,
+  "d_culling": true,
+  "rig": {
+    "right_forearm": "right_forearm",
+    "left_forearm": "left_forearm",
+    "right_lower_leg": "right_lower_leg",
+    "left_lower_leg": "left_lower_leg",
+    "d1": "d1",
+    "b": "b"
+  },
+  "atlases": [
+    {
+      "texture": "model.avatar",
+      "directory": "needsofnature/textures/model.avatar"
+    }
+  ]
+}
